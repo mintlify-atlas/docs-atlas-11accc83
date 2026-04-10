@@ -1,0 +1,185 @@
+---
+title: 'tonic-reflection: gRPC server reflection'
+description: 'Add gRPC server reflection to your tonic server so clients can discover services and their schemas at runtime without a .proto file.'
+keywords: ['tonic-reflection', 'grpc', 'server reflection', 'protobuf', 'rust', 'tonic', 'grpc.reflection']
+---
+
+`tonic-reflection` implements the [gRPC Server Reflection Protocol](https://github.com/grpc/grpc/blob/master/doc/server-reflection.md), which lets gRPC clients—such as `grpcurl` and Postman—query your server for the list of available services and their protobuf schemas. No `.proto` file needs to be shipped to the client separately.
+
+## Installation
+
+```toml Cargo.toml
+[dependencies]
+tonic = "0.14"
+tonic-reflection = "0.14"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+```
+
+## How it works
+
+Reflection works by embedding a serialized `FileDescriptorSet` (the binary representation of your proto files) into your binary at compile time. When a client queries the reflection service, tonic-reflection reads this embedded data and returns the schema information.
+
+You generate the `FileDescriptorSet` at build time using `tonic-prost-build`:
+
+```rust build.rs
+use std::{env, path::PathBuf};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    tonic_prost_build::configure()
+        .file_descriptor_set_path(out_dir.join("helloworld_descriptor.bin"))
+        .compile_protos(
+            &["proto/helloworld/helloworld.proto"],
+            &["proto"],
+        )?;
+    Ok(())
+}
+```
+
+This writes the binary `FileDescriptorSet` to `helloworld_descriptor.bin` inside `OUT_DIR`. You then embed it with the `include_file_descriptor_set!` macro.
+
+## `tonic_reflection::server::Builder`
+
+`Builder` is the entry point for configuring and constructing the reflection service.
+
+### `Builder::configure() -> Builder`
+
+Creates a new builder. By default, the reflection service's own descriptors are included so clients can also reflect on the reflection service itself.
+
+### `register_encoded_file_descriptor_set(encoded: &[u8]) -> Self`
+
+```rust
+pub fn register_encoded_file_descriptor_set(
+    mut self,
+    encoded_file_descriptor_set: &'b [u8],
+) -> Self
+```
+
+Registers a byte slice containing an encoded `FileDescriptorSet`. Use this with `include_bytes!` to embed your compiled descriptor at build time.
+
+```rust
+let descriptor = include_bytes!(concat!(env!("OUT_DIR"), "/proto_descriptor.bin"));
+
+let reflection_service = tonic_reflection::server::Builder::configure()
+    .register_encoded_file_descriptor_set(descriptor)
+    .build_v1()?;
+```
+
+### `register_file_descriptor_set(fds: FileDescriptorSet) -> Self`
+
+Registers an already-decoded `prost_types::FileDescriptorSet`. Use this if you're constructing descriptors programmatically rather than loading them from a file.
+
+### `with_service_name(name: impl Into<String>) -> Self`
+
+```rust
+pub fn with_service_name(mut self, name: impl Into<String>) -> Self
+```
+
+Advertises a specific fully-qualified service name (e.g. `"helloworld.Greeter"`). If this method is never called, all services found in the registered file descriptors are advertised automatically.
+
+### `include_reflection_service(include: bool) -> Self`
+
+Controls whether the reflection service's own schema is included. Defaults to `true`. Set to `false` to hide the reflection service from clients that query the service list.
+
+### `build_v1() -> Result<ServerReflectionServer<impl ServerReflection>, Error>`
+
+Builds the v1 reflection service (the current stable version).
+
+```rust
+let reflection_service = tonic_reflection::server::Builder::configure()
+    .register_encoded_file_descriptor_set(descriptor)
+    .build_v1()?;
+```
+
+### `build_v1alpha() -> Result<ServerReflectionServer<impl ServerReflection>, Error>`
+
+Builds the v1alpha reflection service for compatibility with older clients.
+
+## Errors
+
+`Builder::build_v1()` and `build_v1alpha()` return `Result<_, Error>`:
+
+| Variant | Cause |
+|---|---|
+| `Error::DecodeError(prost::DecodeError)` | The byte slice passed to `register_encoded_file_descriptor_set` couldn't be decoded as a `FileDescriptorSet` |
+| `Error::InvalidFileDescriptorSet(String)` | The decoded descriptor was missing required fields like a file name |
+
+## Full working example
+
+```rust build.rs
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tonic_prost_build::configure()
+        .file_descriptor_set_path("proto_descriptor.bin")
+        .compile_protos(
+            &["proto/helloworld/helloworld.proto"],
+            &["proto/helloworld"],
+        )?;
+    Ok(())
+}
+```
+
+```rust src/main.rs
+use tonic::transport::Server;
+
+pub mod helloworld {
+    tonic::include_proto!("helloworld");
+}
+
+use helloworld::greeter_server::{Greeter, GreeterServer};
+use helloworld::{HelloReply, HelloRequest};
+
+const DESCRIPTOR: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/proto_descriptor.bin"));
+
+#[derive(Default)]
+struct MyGreeter;
+
+#[tonic::async_trait]
+impl Greeter for MyGreeter {
+    async fn say_hello(
+        &self,
+        request: tonic::Request<HelloRequest>,
+    ) -> Result<tonic::Response<HelloReply>, tonic::Status> {
+        Ok(tonic::Response::new(HelloReply {
+            message: format!("Hello, {}!", request.into_inner().name),
+        }))
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let reflection_service = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(DESCRIPTOR)
+        .build_v1()?;
+
+    let addr = "[::1]:50051".parse()?;
+
+    Server::builder()
+        .add_service(reflection_service)
+        .add_service(GreeterServer::new(MyGreeter::default()))
+        .serve(addr)
+        .await?;
+
+    Ok(())
+}
+```
+
+Once running, you can query your server with `grpcurl`:
+
+```bash
+# List all services
+grpcurl -plaintext localhost:50051 list
+
+# Describe a service
+grpcurl -plaintext localhost:50051 describe helloworld.Greeter
+```
+
+<Tip>
+  Register descriptors for every proto package your server exposes. If you have multiple `.proto` files, generate and embed a single combined `FileDescriptorSet` that includes all of them by passing all files to `compile_protos`.
+</Tip>
+
+<Warning>
+  The `file_descriptor_set_path` option writes the binary to `OUT_DIR`. Make sure you rebuild when proto files change—add `rerun-if-changed` directives to your `build.rs` if needed, or rely on the default `emit_rerun_if_changed` behavior in `tonic-prost-build`.
+</Warning>

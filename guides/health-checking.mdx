@@ -1,0 +1,191 @@
+---
+title: "Health checking with tonic-health"
+description: "Add the standard gRPC health checking protocol to a Tonic server so load balancers and probes can query service readiness at runtime."
+keywords: ["tonic", "health", "grpc", "health-checking", "tonic-health", "serving", "not-serving"]
+---
+
+The `tonic-health` crate implements the [gRPC health checking protocol](https://github.com/grpc/grpc/blob/master/doc/health-checking.md). It exposes a `grpc.health.v1.Health` service that external probes, load balancers, and orchestrators like Kubernetes can query to learn whether your application services are ready to accept traffic. The crate tracks per-service status using a `HealthReporter` that you hold onto in your application code and update as services come up or go down.
+
+## Add the dependency
+
+```toml Cargo.toml
+[dependencies]
+tonic = "*"
+tonic-health = "0.14"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+```
+
+## Basic setup
+
+<Steps>
+  <Step title="Create the reporter and health service">
+    Call `health_reporter()` to get a `HealthReporter` and a linked `HealthServer`. The reporter lets you update statuses; the server handles incoming health check requests.
+
+    ```rust
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    ```
+  </Step>
+
+  <Step title="Register your services as serving">
+    Use `set_serving` with the generated server wrapper type for each service you want to advertise. The method uses the `NamedService` trait to look up the fully-qualified service name automatically.
+
+    ```rust
+    use hello_world::greeter_server::GreeterServer;
+    use tonic_health::server::HealthReporter;
+
+    health_reporter
+        .set_serving::<GreeterServer<MyGreeter>>()
+        .await;
+    ```
+  </Step>
+
+  <Step title="Add the health service to your server">
+    Register `health_service` alongside your application services on the same `Server::builder`. No additional routing configuration is needed.
+
+    ```rust
+    use tonic::transport::Server;
+
+    Server::builder()
+        .add_service(health_service)
+        .add_service(GreeterServer::new(MyGreeter::default()))
+        .serve(addr)
+        .await?;
+    ```
+  </Step>
+</Steps>
+
+## Complete server example
+
+This is the full example from `examples/src/health/server.rs`. It registers a `GreeterServer` as serving, then spawns a background task that toggles the health status every second to demonstrate live status changes.
+
+```rust
+use tonic::{Request, Response, Status, transport::Server};
+use hello_world::greeter_server::{Greeter, GreeterServer};
+use hello_world::{HelloReply, HelloRequest};
+use std::time::Duration;
+use tonic_health::server::HealthReporter;
+
+pub mod hello_world {
+    tonic::include_proto!("helloworld");
+}
+
+#[derive(Default)]
+pub struct MyGreeter {}
+
+#[tonic::async_trait]
+impl Greeter for MyGreeter {
+    async fn say_hello(
+        &self,
+        request: Request<HelloRequest>,
+    ) -> Result<Response<HelloReply>, Status> {
+        let reply = hello_world::HelloReply {
+            message: format!("Hello {}!", request.into_inner().name),
+        };
+        Ok(Response::new(reply))
+    }
+}
+
+async fn twiddle_service_status(reporter: HealthReporter) {
+    let mut iter = 0u64;
+    loop {
+        iter += 1;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        if iter % 2 == 0 {
+            reporter.set_serving::<GreeterServer<MyGreeter>>().await;
+        } else {
+            reporter.set_not_serving::<GreeterServer<MyGreeter>>().await;
+        };
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<GreeterServer<MyGreeter>>()
+        .await;
+
+    tokio::spawn(twiddle_service_status(health_reporter.clone()));
+
+    let addr = "[::1]:50051".parse().unwrap();
+    let greeter = MyGreeter::default();
+
+    println!("HealthServer + GreeterServer listening on {addr}");
+
+    Server::builder()
+        .add_service(health_service)
+        .add_service(GreeterServer::new(greeter))
+        .serve(addr)
+        .await?;
+
+    Ok(())
+}
+```
+
+<Note>
+  `HealthReporter` is `Clone`, so you can pass copies to background tasks or multiple parts of your application without wrapping it in an `Arc`.
+</Note>
+
+## Marking a service as not serving
+
+Call `set_not_serving` with the same server wrapper type to signal that a service is temporarily unavailable. Any active `Watch` streams will receive the updated status immediately.
+
+```rust
+reporter.set_not_serving::<GreeterServer<MyGreeter>>().await;
+```
+
+To bring it back up:
+
+```rust
+reporter.set_serving::<GreeterServer<MyGreeter>>().await;
+```
+
+## Setting status by name
+
+If you need to set status for a service you do not have a generated type for, use `set_service_status` with the fully-qualified service name string directly:
+
+```rust
+use tonic_health::ServingStatus;
+
+reporter
+    .set_service_status("mypackage.MyService", ServingStatus::Serving)
+    .await;
+```
+
+## Removing a service
+
+To deregister a service entirely, call `clear_service_status`. Any `Watch` streams watching that service will complete.
+
+```rust
+reporter.clear_service_status("mypackage.MyService").await;
+```
+
+<Warning>
+  Querying a service name that has never been registered returns a `NOT_FOUND` gRPC status code, not an `UNKNOWN` health status. Register each service with at least one `set_serving` or `set_service_status` call before clients start probing it.
+</Warning>
+
+## Testing with grpc_health_probe
+
+The [grpc_health_probe](https://github.com/grpc-ecosystem/grpc-health-probe) CLI tool speaks the standard health protocol and is a convenient way to test your setup:
+
+```bash
+grpc_health_probe -addr=[::1]:50051 -service=helloworld.Greeter
+```
+
+You can also loop it to observe status changes over time:
+
+```bash
+while true; do
+  grpc_health_probe -addr=[::1]:50051 -service=helloworld.Greeter
+  sleep 1
+done
+```
+
+## Overall server health
+
+The health service always registers the empty string `""` as a service name representing overall server health. It starts in `Serving` state. Tools that probe without specifying a service name query this entry.
+
+<Tip>
+  The `grpc.health.v1.Health` service itself is also included in the responses served by the health server. There is no separate registration step needed for it.
+</Tip>

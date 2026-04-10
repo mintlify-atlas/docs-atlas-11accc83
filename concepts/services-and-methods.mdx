@@ -1,0 +1,251 @@
+---
+title: 'Services and methods in tonic'
+description: 'Learn how gRPC services and RPC methods are defined in protobuf, generated into Rust traits by tonic-build, and implemented using async_trait.'
+---
+
+A gRPC service is a named collection of RPC methods. In tonic, each service defined in a `.proto` file becomes a Rust trait, and each RPC method becomes an `async fn` on that trait. You implement the trait for your own struct, and tonic handles encoding, framing, and routing over HTTP/2.
+
+## Defining a service in protobuf
+
+Services are declared using the `service` keyword, with each RPC method specifying its request and response types. The `stream` keyword on either side marks a streaming method.
+
+```protobuf
+// examples/proto/helloworld/helloworld.proto
+syntax = "proto3";
+package helloworld;
+
+service Greeter {
+  rpc SayHello (HelloRequest) returns (HelloReply) {}
+}
+
+message HelloRequest {
+  string name = 1;
+}
+
+message HelloReply {
+  string message = 1;
+}
+```
+
+## The four RPC method types
+
+gRPC defines four method patterns based on whether the request and response sides stream.
+
+<CardGroup cols={2}>
+  <Card title="Unary" icon="arrow-right">
+    Single request, single response. The most common pattern.
+    ```protobuf
+    rpc GetFeature(Point) returns (Feature) {}
+    ```
+  </Card>
+  <Card title="Server streaming" icon="arrow-right-from-line">
+    Single request, stream of responses.
+    ```protobuf
+    rpc ListFeatures(Rectangle) returns (stream Feature) {}
+    ```
+  </Card>
+  <Card title="Client streaming" icon="arrow-right-to-line">
+    Stream of requests, single response.
+    ```protobuf
+    rpc RecordRoute(stream Point) returns (RouteSummary) {}
+    ```
+  </Card>
+  <Card title="Bidirectional streaming" icon="arrows-left-right">
+    Stream of requests and stream of responses.
+    ```protobuf
+    rpc RouteChat(stream RouteNote) returns (stream RouteNote) {}
+    ```
+  </Card>
+</CardGroup>
+
+## Generating Rust code with tonic-build
+
+`tonic-build` reads your `.proto` files at compile time and generates a server trait and a client struct for each service. Add it to your `build.rs`:
+
+```rust
+// build.rs
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tonic_prost_build::compile_protos("proto/helloworld/helloworld.proto")?;
+    Ok(())
+}
+```
+
+Then include the generated module in your code:
+
+```rust
+pub mod hello_world {
+    tonic::include_proto!("helloworld");
+}
+```
+
+The macro expands to the path where `OUT_DIR` placed the generated file. For the `Greeter` service, you get:
+
+- `hello_world::greeter_server::Greeter` — the trait you implement
+- `hello_world::greeter_server::GreeterServer<T>` — the tower `Service` wrapper used to register your implementation
+- `hello_world::greeter_client::GreeterClient<T>` — the generated client stub
+
+## The generated server trait
+
+For the `Greeter` service above, `tonic-build` generates a trait resembling:
+
+```rust
+#[tonic::async_trait]
+pub trait Greeter: Send + Sync + 'static {
+    async fn say_hello(
+        &self,
+        request: tonic::Request<HelloRequest>,
+    ) -> Result<tonic::Response<HelloReply>, tonic::Status>;
+}
+```
+
+Server-streaming and bidirectional-streaming methods also require an associated `type` for the response stream:
+
+```rust
+#[tonic::async_trait]
+pub trait RouteGuide: Send + Sync + 'static {
+    // Unary
+    async fn get_feature(
+        &self,
+        request: tonic::Request<Point>,
+    ) -> Result<tonic::Response<Feature>, tonic::Status>;
+
+    // Server streaming — requires an associated stream type
+    type ListFeaturesStream: futures_core::Stream<
+        Item = Result<Feature, tonic::Status>
+    > + Send + 'static;
+
+    async fn list_features(
+        &self,
+        request: tonic::Request<Rectangle>,
+    ) -> Result<tonic::Response<Self::ListFeaturesStream>, tonic::Status>;
+
+    // Client streaming
+    async fn record_route(
+        &self,
+        request: tonic::Request<tonic::Streaming<Point>>,
+    ) -> Result<tonic::Response<RouteSummary>, tonic::Status>;
+
+    // Bidirectional streaming
+    type RouteChatStream: futures_core::Stream<
+        Item = Result<RouteNote, tonic::Status>
+    > + Send + 'static;
+
+    async fn route_chat(
+        &self,
+        request: tonic::Request<tonic::Streaming<RouteNote>>,
+    ) -> Result<tonic::Response<Self::RouteChatStream>, tonic::Status>;
+}
+```
+
+## Implementing a service
+
+Use `#[tonic::async_trait]` to implement the generated trait on your struct. This macro is a re-export of [`async-trait`](https://docs.rs/async-trait), required because Rust traits cannot have `async fn` methods directly.
+
+```rust
+use hello_world::greeter_server::{Greeter, GreeterServer};
+use hello_world::{HelloReply, HelloRequest};
+use tonic::{Request, Response, Status};
+
+pub mod hello_world {
+    tonic::include_proto!("helloworld");
+}
+
+#[derive(Default)]
+pub struct MyGreeter {}
+
+#[tonic::async_trait]
+impl Greeter for MyGreeter {
+    async fn say_hello(
+        &self,
+        request: Request<HelloRequest>,
+    ) -> Result<Response<HelloReply>, Status> {
+        let reply = HelloReply {
+            message: format!("Hello {}!", request.into_inner().name),
+        };
+        Ok(Response::new(reply))
+    }
+}
+```
+
+Register the implementation with the transport server:
+
+```rust
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let addr = "[::1]:50051".parse()?;
+
+    tonic::transport::Server::builder()
+        .add_service(GreeterServer::new(MyGreeter::default()))
+        .serve(addr)
+        .await?;
+
+    Ok(())
+}
+```
+
+## Request\<T\> and Response\<T\>
+
+Every method receives a `Request<T>` and must return a `Response<T>` (or `Err(Status)`). Both types carry the message payload alongside gRPC metadata.
+
+<Tabs>
+  <Tab title="Request<T>">
+    | Method | Description |
+    |--------|-------------|
+    | `request.into_inner()` | Consume the request and return the message `T`. |
+    | `request.get_ref()` | Borrow the message without consuming. |
+    | `request.get_mut()` | Mutably borrow the message. |
+    | `request.metadata()` | Read incoming gRPC metadata (headers). |
+    | `request.metadata_mut()` | Mutate metadata before forwarding. |
+    | `request.extensions()` | Access request extensions (e.g., set by interceptors). |
+    | `request.remote_addr()` | Get the client's socket address (server only). |
+    | `request.into_parts()` | Decompose into `(MetadataMap, Extensions, T)`. |
+  </Tab>
+  <Tab title="Response<T>">
+    | Method | Description |
+    |--------|-------------|
+    | `Response::new(message)` | Wrap a message in a response with empty metadata. |
+    | `response.into_inner()` | Consume and return the message `T`. |
+    | `response.get_ref()` | Borrow the message. |
+    | `response.metadata_mut()` | Add response metadata (headers sent to client). |
+    | `response.into_parts()` | Decompose into `(MetadataMap, T, Extensions)`. |
+  </Tab>
+</Tabs>
+
+A typical unary handler accesses the inner message with `into_inner()` and wraps its result with `Response::new()`:
+
+```rust
+async fn say_hello(
+    &self,
+    request: Request<HelloRequest>,
+) -> Result<Response<HelloReply>, Status> {
+    let name = request.into_inner().name;
+    Ok(Response::new(HelloReply {
+        message: format!("Hello {name}!"),
+    }))
+}
+```
+
+## The NamedService trait
+
+`NamedService` is a trait that provides a static service name string, used by tonic's router to dispatch requests to the correct handler.
+
+```rust
+// tonic/src/server/mod.rs
+pub trait NamedService {
+    const NAME: &'static str;
+}
+```
+
+`tonic-build` generates this implementation automatically. The name follows the gRPC URL format: `{package}.{ServiceName}`. For a service `Greeter` in package `helloworld`, `NAME` is `"helloworld.Greeter"`.
+
+You can also implement it manually when building services without codegen:
+
+```rust
+impl tonic::server::NamedService for MyService {
+    const NAME: &'static str = "mypackage.MyService";
+}
+```
+
+<Note>
+The `NAME` constant is used by `Server::add_service` to build the routing path `/{package}.{ServiceName}/{MethodName}`.
+</Note>

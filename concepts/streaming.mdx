@@ -1,0 +1,331 @@
+---
+title: 'Streaming RPCs in tonic'
+description: 'Understand the Streaming<T> type and all four gRPC streaming patterns: unary, server streaming, client streaming, and bidirectional streaming.'
+---
+
+gRPC supports four RPC patterns that differ in how many messages flow in each direction. Tonic represents incoming message streams with `tonic::Streaming<T>` and outgoing streams using any type that implements `Stream<Item = Result<T, Status>> + Send + 'static`. This page covers each pattern with working code from the tonic examples.
+
+## The Streaming\<T\> type
+
+`tonic::Streaming<T>` (re-exported from `tonic::codec::Streaming`) is a wrapper around an HTTP/2 body that decodes length-prefixed gRPC frames into typed messages. It implements both `Stream` and has a convenience method for manual polling.
+
+```rust
+// Iterate a Streaming<T> with tokio_stream::StreamExt
+use tokio_stream::StreamExt;
+
+while let Some(result) = stream.next().await {
+    let message = result?; // result is Result<T, Status>
+    // process message
+}
+```
+
+<Note>
+`Streaming<T>` implements `Unpin`, so you can call `.next().await` on it directly without boxing or pinning.
+</Note>
+
+Server-side streaming handlers receive `Request<Streaming<T>>` for client-streaming and bidirectional methods. Server-streaming and bidirectional methods must also declare an associated output stream type.
+
+---
+
+## Pattern 1: Unary
+
+A single request and a single response. This is the simplest pattern and the one most services start with.
+
+**Proto definition:**
+
+```protobuf
+rpc SayHello(HelloRequest) returns (HelloReply) {}
+```
+
+**Server implementation:**
+
+```rust
+#[tonic::async_trait]
+impl Greeter for MyGreeter {
+    async fn say_hello(
+        &self,
+        request: Request<HelloRequest>,
+    ) -> Result<Response<HelloReply>, Status> {
+        let reply = HelloReply {
+            message: format!("Hello {}!", request.into_inner().name),
+        };
+        Ok(Response::new(reply))
+    }
+}
+```
+
+**Client call:**
+
+```rust
+let response = client
+    .say_hello(HelloRequest { name: "Tonic".into() })
+    .await?;
+
+println!("Response: {}", response.into_inner().message);
+```
+
+---
+
+## Pattern 2: Server streaming
+
+The client sends one request; the server sends back a stream of responses. Use this when results are large or produced incrementally.
+
+**Proto definition:**
+
+```protobuf
+rpc ListFeatures(Rectangle) returns (stream Feature) {}
+```
+
+**Server implementation:**
+
+The associated type `ListFeaturesStream` names the outbound stream. A common approach spawns a task that sends items through an `mpsc` channel, then wraps the receiver as a `ReceiverStream`.
+
+```rust
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+
+type ListFeaturesStream = ReceiverStream<Result<Feature, Status>>;
+
+#[tonic::async_trait]
+impl RouteGuide for RouteGuideService {
+    type ListFeaturesStream = ListFeaturesStream;
+
+    async fn list_features(
+        &self,
+        request: Request<Rectangle>,
+    ) -> Result<Response<Self::ListFeaturesStream>, Status> {
+        let (tx, rx) = mpsc::channel(4);
+        let features = self.features.clone();
+
+        tokio::spawn(async move {
+            for feature in &features[..] {
+                if in_range(feature.location.as_ref().unwrap(), request.get_ref()) {
+                    tx.send(Ok(feature.clone())).await.unwrap();
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+```
+
+**Client consumption:**
+
+```rust
+let response = client
+    .list_features(Rectangle { /* ... */ })
+    .await?;
+
+let mut stream = response.into_inner();
+
+while let Some(feature) = stream.next().await {
+    println!("Feature: {:?}", feature?);
+}
+```
+
+<Tip>
+You can also build the stream inline using `async_stream::try_stream!` (see the bidirectional example below), which avoids the channel boilerplate when you don't need disconnect detection.
+</Tip>
+
+For use cases where detecting client disconnection matters, spawn a task and use a channel. When the client drops the response, the channel receiver is dropped, causing `tx.send(...)` to return an error that breaks the loop:
+
+```rust
+let (tx, rx) = mpsc::channel(128);
+
+tokio::spawn(async move {
+    while let Some(item) = source_stream.next().await {
+        if tx.send(Ok(item)).await.is_err() {
+            // Client disconnected
+            break;
+        }
+    }
+});
+
+Ok(Response::new(ReceiverStream::new(rx)))
+```
+
+---
+
+## Pattern 3: Client streaming
+
+The client sends a stream of requests; the server collects them and replies once. Use this for aggregating data, like recording a route from a series of GPS points.
+
+**Proto definition:**
+
+```protobuf
+rpc RecordRoute(stream Point) returns (RouteSummary) {}
+```
+
+**Server implementation:**
+
+The request type is `Request<Streaming<Point>>`. Call `request.into_inner()` to get the stream, then iterate with `.next().await`.
+
+```rust
+#[tonic::async_trait]
+impl RouteGuide for RouteGuideService {
+    async fn record_route(
+        &self,
+        request: Request<tonic::Streaming<Point>>,
+    ) -> Result<Response<RouteSummary>, Status> {
+        let mut stream = request.into_inner();
+        let mut summary = RouteSummary::default();
+        let mut last_point = None;
+        let now = std::time::Instant::now();
+
+        while let Some(point) = stream.next().await {
+            let point = point?;
+            summary.point_count += 1;
+
+            if let Some(ref last) = last_point {
+                summary.distance += calc_distance(last, &point);
+            }
+            last_point = Some(point);
+        }
+
+        summary.elapsed_time = now.elapsed().as_secs() as i32;
+        Ok(Response::new(summary))
+    }
+}
+```
+
+**Client call:**
+
+Pass any `Stream<Item = Point>` (or wrap it in a `Request`):
+
+```rust
+use tokio_stream::iter;
+
+let points = vec![Point { latitude: 1, longitude: 2 }, /* ... */];
+let response = client.record_route(iter(points)).await?;
+println!("Summary: {:?}", response.into_inner());
+```
+
+---
+
+## Pattern 4: Bidirectional streaming
+
+Both sides send streams simultaneously. The streams are independent — the server can reply before the client finishes, or hold replies until it has received everything.
+
+**Proto definition:**
+
+```protobuf
+rpc RouteChat(stream RouteNote) returns (stream RouteNote) {}
+```
+
+**Server implementation with async_stream:**
+
+```rust
+use async_stream::try_stream;
+use std::collections::HashMap;
+
+type RouteChatStream = Pin<Box<dyn Stream<Item = Result<RouteNote, Status>> + Send + 'static>>;
+
+#[tonic::async_trait]
+impl RouteGuide for RouteGuideService {
+    type RouteChatStream = RouteChatStream;
+
+    async fn route_chat(
+        &self,
+        request: Request<tonic::Streaming<RouteNote>>,
+    ) -> Result<Response<Self::RouteChatStream>, Status> {
+        let mut notes: HashMap<Point, Vec<RouteNote>> = HashMap::new();
+        let mut stream = request.into_inner();
+
+        let output = try_stream! {
+            while let Some(note) = stream.next().await {
+                let note = note?;
+                let location = note.location.clone().unwrap();
+                let location_notes = notes.entry(location).or_default();
+                location_notes.push(note);
+
+                for note in location_notes.iter() {
+                    yield note.clone();
+                }
+            }
+        };
+
+        Ok(Response::new(Box::pin(output) as Self::RouteChatStream))
+    }
+}
+```
+
+**Server implementation with a channel (disconnect-aware):**
+
+The streaming echo server in `examples/src/streaming/server.rs` uses a channel so it can detect when the client disconnects mid-stream:
+
+```rust
+type BidirectionalStreamingEchoStream =
+    Pin<Box<dyn Stream<Item = Result<EchoResponse, Status>> + Send>>;
+
+#[tonic::async_trait]
+impl Echo for EchoServer {
+    type BidirectionalStreamingEchoStream = BidirectionalStreamingEchoStream;
+
+    async fn bidirectional_streaming_echo(
+        &self,
+        req: Request<Streaming<EchoRequest>>,
+    ) -> Result<Response<Self::BidirectionalStreamingEchoStream>, Status> {
+        let mut in_stream = req.into_inner();
+        let (tx, rx) = mpsc::channel(128);
+
+        tokio::spawn(async move {
+            while let Some(result) = in_stream.next().await {
+                match result {
+                    Ok(v) => {
+                        tx.send(Ok(EchoResponse { message: v.message }))
+                            .await
+                            .expect("working rx");
+                    }
+                    Err(err) => {
+                        // Forward the error or break on disconnect
+                        if tx.send(Err(err)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(rx)) as Self::BidirectionalStreamingEchoStream
+        ))
+    }
+}
+```
+
+**Client call:**
+
+```rust
+use tokio_stream::StreamExt;
+
+let in_stream = tokio_stream::iter(1..=17)
+    .map(|i| EchoRequest { message: format!("msg {i:02}") });
+
+let response = client.bidirectional_streaming_echo(in_stream).await?;
+let mut resp_stream = response.into_inner();
+
+while let Some(received) = resp_stream.next().await {
+    println!("Received: {}", received?.message);
+}
+```
+
+---
+
+## Summary
+
+<AccordionGroup>
+  <Accordion title="Choosing a stream type for server output">
+    The associated stream type for server-streaming and bidirectional methods can be any type satisfying `Stream<Item = Result<T, Status>> + Send + 'static`. Common choices:
+
+    - `ReceiverStream<Result<T, Status>>` from `tokio_stream::wrappers` — useful when you spawn a task and send items through an `mpsc::channel`.
+    - `Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>` — an erased type alias suitable when the stream shape varies or when using `async_stream`.
+    - A concrete stream type from `tokio_stream` or `futures` — when no task spawn is needed.
+  </Accordion>
+  <Accordion title="Error handling in streams">
+    Each item in `Streaming<T>` is `Result<T, Status>`. The `?` operator on `point?` inside a streaming handler will propagate the `Status` as the method's `Err` return, ending the RPC. If you need to handle errors without ending the whole call, match on the result explicitly.
+  </Accordion>
+  <Accordion title="Backpressure with mpsc channels">
+    When using `mpsc::channel(capacity)`, the capacity controls backpressure. If the sender gets too far ahead, `tx.send(...).await` will yield until the receiver drains the buffer. Choose a capacity appropriate for your message size and throughput requirements.
+  </Accordion>
+</AccordionGroup>

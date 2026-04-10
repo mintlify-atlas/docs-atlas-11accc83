@@ -1,0 +1,194 @@
+---
+title: "gRPC-Web support with tonic-web"
+description: "Serve browser clients and HTTP/1.1 proxies from a Tonic server by adding the gRPC-Web translation layer with a single line of configuration."
+keywords: ["tonic", "grpc-web", "browser", "http1", "tonic-web", "cors", "grpc web"]
+---
+
+Standard gRPC relies on HTTP/2 features that browser APIs do not expose, which means browser JavaScript cannot call a gRPC server directly. The gRPC-Web protocol is a variant that works over HTTP/1.1 and HTTP/2, making it compatible with browsers and any proxy that does not speak HTTP/2. The `tonic-web` crate adds a Tower middleware layer that translates between the gRPC-Web wire format and standard gRPC, so your existing Tonic service implementations require no changes.
+
+## Add the dependency
+
+```toml Cargo.toml
+[dependencies]
+tonic = "*"
+tonic-web = "0.14"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+```
+
+For the full server example below you also need:
+
+```toml Cargo.toml
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+tracing-subscriber = "0.3"
+```
+
+## Basic setup
+
+<Steps>
+  <Step title="Enable HTTP/1.1 on the server">
+    gRPC-Web runs over HTTP/1.1, so you must tell the Tonic server to accept HTTP/1.1 connections. Add `.accept_http1(true)` to the server builder:
+
+    ```rust
+    Server::builder()
+        .accept_http1(true)
+        // ...
+    ```
+
+    <Note>
+      If your server has TLS enabled, you can skip `.accept_http1(true)`. The browser handles ALPN negotiation and will use HTTP/1.1 or HTTP/2 as appropriate.
+    </Note>
+  </Step>
+
+  <Step title="Apply the gRPC-Web layer">
+    Wrap your service with `GrpcWebLayer::new()`. The layer intercepts gRPC-Web requests, translates them to standard gRPC, and re-encodes the responses before sending them back to the browser.
+
+    Use `tower::ServiceBuilder` with `LayerExt::named_layer` to apply the layer per service:
+
+    ```rust
+    use tonic::service::LayerExt as _;
+
+    let greeter = tower::ServiceBuilder::new()
+        .layer(tonic_web::GrpcWebLayer::new())
+        .into_inner()
+        .named_layer(GreeterServer::new(MyGreeter::default()));
+    ```
+
+    Then add the wrapped service to the server:
+
+    ```rust
+    Server::builder()
+        .accept_http1(true)
+        .add_service(greeter)
+        .serve(addr)
+        .await?;
+    ```
+  </Step>
+</Steps>
+
+## Complete server example
+
+This is the full example from `examples/src/grpc-web/server.rs`. It adds a CORS layer so that browsers from other origins can send preflight requests:
+
+```rust
+use tonic::{Request, Response, Status, service::LayerExt as _, transport::Server};
+use hello_world::greeter_server::{Greeter, GreeterServer};
+use hello_world::{HelloReply, HelloRequest};
+
+pub mod hello_world {
+    tonic::include_proto!("helloworld");
+}
+
+#[derive(Default)]
+pub struct MyGreeter {}
+
+#[tonic::async_trait]
+impl Greeter for MyGreeter {
+    async fn say_hello(
+        &self,
+        request: Request<HelloRequest>,
+    ) -> Result<Response<HelloReply>, Status> {
+        println!("Got a request from {:?}", request.remote_addr());
+
+        let reply = hello_world::HelloReply {
+            message: format!("Hello {}!", request.into_inner().name),
+        };
+        Ok(Response::new(reply))
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+
+    let addr = "127.0.0.1:3000".parse().unwrap();
+
+    let greeter = MyGreeter::default();
+    let greeter = tower::ServiceBuilder::new()
+        .layer(tower_http::cors::CorsLayer::new())
+        .layer(tonic_web::GrpcWebLayer::new())
+        .into_inner()
+        .named_layer(GreeterServer::new(greeter));
+
+    println!("GreeterServer listening on {addr}");
+
+    Server::builder()
+        // GrpcWeb is over http1 so we must enable it.
+        .accept_http1(true)
+        .add_service(greeter)
+        .serve(addr)
+        .await?;
+
+    Ok(())
+}
+```
+
+## Calling from a Rust gRPC-Web client
+
+If you need a Rust client that speaks gRPC-Web (for example, to interop test against a gRPC-Web server), use `GrpcWebClientLayer` with a raw hyper HTTP client:
+
+```rust
+use hello_world::{HelloRequest, greeter_client::GreeterClient};
+use hyper_util::rt::TokioExecutor;
+use tonic_web::GrpcWebClientLayer;
+
+pub mod hello_world {
+    tonic::include_proto!("helloworld");
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Must use hyper directly...
+    let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+        .build_http();
+
+    let svc = tower::ServiceBuilder::new()
+        .layer(GrpcWebClientLayer::new())
+        .service(client);
+
+    let mut client = GreeterClient::with_origin(svc, "http://127.0.0.1:3000".try_into()?);
+
+    let request = tonic::Request::new(HelloRequest {
+        name: "Tonic".into(),
+    });
+
+    let response = client.say_hello(request).await?;
+    println!("RESPONSE={response:?}");
+
+    Ok(())
+}
+```
+
+## CORS configuration
+
+The `tonic-web` crate only handles CORS preflight requests that are specifically for gRPC-Web traffic. For broader cross-origin policies — such as allowing requests from specific origins or setting custom headers — compose it with a dedicated CORS layer like `tower_http::cors::CorsLayer`:
+
+```toml Cargo.toml
+tower-http = { version = "0.6", features = ["cors"] }
+```
+
+```rust
+use tower_http::cors::{CorsLayer, Any};
+use http::Method;
+
+let cors = CorsLayer::new()
+    .allow_methods([Method::POST])
+    .allow_origin(Any)
+    .allow_headers(Any);
+
+let greeter = tower::ServiceBuilder::new()
+    .layer(cors)
+    .layer(tonic_web::GrpcWebLayer::new())
+    .into_inner()
+    .named_layer(GreeterServer::new(MyGreeter::default()));
+```
+
+## Limitations
+
+<Warning>
+  gRPC-Web clients can only perform **unary** and **server-streaming** calls. Client streaming and bi-directional streaming are not supported in the gRPC-Web protocol and are not handled by `tonic-web`.
+</Warning>
+
+- `tonic-web` is designed for gRPC-Web compliant clients only. It does not handle arbitrary HTTP/1.x requests or custom protocols.
+- There is no WebSocket transport support.
+- The built-in CORS handling only applies to gRPC-Web and gRPC-Web preflight requests, not general browser traffic.

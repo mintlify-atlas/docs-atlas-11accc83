@@ -1,0 +1,248 @@
+---
+title: 'tonic-types: protobuf types and rich gRPC errors'
+description: 'Use well-known protobuf types and the gRPC Richer Error Model in tonic with StatusExt, ErrorDetails, and standard error detail structs.'
+keywords: ['tonic-types', 'grpc', 'error details', 'richer error model', 'protobuf', 'rust', 'StatusExt', 'ErrorDetails']
+---
+
+`tonic-types` provides two things: generated Rust types for well-known protobuf definitions from `google.rpc`, and an implementation of the [gRPC Richer Error Model](https://www.grpc.io/docs/guides/error/). The Richer Error Model lets servers attach structured, machine-readable error detail messages to a `tonic::Status`, going beyond the basic status code and message string.
+
+## Installation
+
+```toml Cargo.toml
+[dependencies]
+tonic = "0.14"
+tonic-types = "0.14"
+```
+
+## Well-known types
+
+The `tonic_types::pb` module re-exports generated Rust types from the `google.rpc` protobuf package. These include the `Status` message and all standard error detail types, available as `tonic_types::pb::*`.
+
+A file descriptor set is also available via `tonic_types::pb::FILE_DESCRIPTOR_SET` for use with `tonic-reflection`.
+
+## The gRPC Richer Error Model
+
+Standard gRPC status codes are often insufficient to describe what went wrong. The Richer Error Model embeds a serialized `google.rpc.Status` proto into the error metadata, which can carry a list of typed detail messages alongside the basic status code and message.
+
+`tonic-types` implements this model through two components:
+
+- **`ErrorDetails`** — a struct that collects up to one of each standard error detail type
+- **`StatusExt`** — a trait implemented on `tonic::Status` that adds methods for creating statuses with error details and extracting them on the client side
+
+## `ErrorDetails`
+
+`ErrorDetails` is a container for standard `google.rpc` error detail types. Create one, populate whichever fields apply, then pass it to `Status::with_error_details`.
+
+```rust
+use tonic_types::ErrorDetails;
+
+let mut err_details = ErrorDetails::new();
+
+err_details
+    .add_bad_request_violation("email", "must be a valid email address")
+    .add_bad_request_violation("name", "must not be empty")
+    .add_help_link("Validation rules", "https://example.com/docs/validation")
+    .set_localized_message("en-US", "The request contained invalid fields.");
+```
+
+### Standard error detail types
+
+Each detail type corresponds to a message defined in [google/rpc/error_details.proto](https://github.com/googleapis/googleapis/blob/master/google/rpc/error_details.proto).
+
+| Type | Description |
+|---|---|
+| `RetryInfo` | How long the client should wait before retrying |
+| `DebugInfo` | Stack trace entries and a detail string, for debugging |
+| `QuotaFailure` | Which quota was exceeded and why |
+| `ErrorInfo` | Machine-readable error reason, domain, and metadata |
+| `PreconditionFailure` | Which preconditions were violated and why |
+| `BadRequest` | Which request fields were invalid and why |
+| `RequestInfo` | A request ID and serving data for debugging |
+| `ResourceInfo` | The resource type, name, owner, and description |
+| `Help` | Links to documentation or support resources |
+| `LocalizedMessage` | A locale-specific human-readable message |
+
+The `ErrorDetail` enum wraps all of these types and is used when working with the vector-based API (`with_error_details_vec` / `get_error_details_vec`).
+
+## `StatusExt` trait
+
+`StatusExt` is implemented on `tonic::Status` and is sealed—you cannot implement it yourself. Import it alongside `tonic::Status` to access the additional associated functions and methods.
+
+```rust
+use tonic::{Code, Status};
+use tonic_types::{ErrorDetails, StatusExt};
+```
+
+### Creating a status with error details
+
+#### `Status::with_error_details`
+
+```rust
+fn with_error_details(
+    code: Code,
+    message: impl Into<String>,
+    details: ErrorDetails,
+) -> tonic::Status
+```
+
+Creates a `tonic::Status` with the given code and message, with the `ErrorDetails` serialized into the status metadata.
+
+```rust
+let status = Status::with_error_details(
+    Code::InvalidArgument,
+    "bad request",
+    err_details,
+);
+return Err(status);
+```
+
+#### `Status::with_error_details_and_metadata`
+
+```rust
+fn with_error_details_and_metadata(
+    code: Code,
+    message: impl Into<String>,
+    details: ErrorDetails,
+    metadata: MetadataMap,
+) -> tonic::Status
+```
+
+Same as `with_error_details`, but also attaches custom gRPC metadata to the status.
+
+#### `Status::with_error_details_vec`
+
+```rust
+fn with_error_details_vec(
+    code: Code,
+    message: impl Into<String>,
+    details: impl IntoIterator<Item = ErrorDetail>,
+) -> tonic::Status
+```
+
+Alternative API using a vector of `ErrorDetail` enum values instead of an `ErrorDetails` struct. Use this when you need ordered control over which detail types appear or need to include the same type more than once.
+
+```rust
+use tonic_types::{BadRequest, RetryInfo, StatusExt};
+use std::time::Duration;
+
+let status = Status::with_error_details_vec(
+    Code::ResourceExhausted,
+    "rate limit exceeded",
+    vec![
+        RetryInfo::new(Some(Duration::from_secs(30))).into(),
+        BadRequest::with_violation("requests_per_minute", "exceeded limit of 100").into(),
+    ],
+);
+```
+
+### Extracting error details
+
+On the client side, call these methods on a received `tonic::Status`.
+
+#### `status.get_error_details() -> ErrorDetails`
+
+Returns an `ErrorDetails` struct extracted from the status metadata. If decoding fails or there are no details, returns an empty `ErrorDetails`.
+
+```rust
+let err_details = status.get_error_details();
+
+if let Some(bad_request) = err_details.bad_request() {
+    for violation in &bad_request.field_violations {
+        eprintln!("Field '{}': {}", violation.field, violation.description);
+    }
+}
+```
+
+#### `status.check_error_details() -> Result<ErrorDetails, DecodeError>`
+
+Like `get_error_details`, but surfaces decode errors rather than silently returning empty details. Use this during development or when you need to distinguish malformed details from absent ones.
+
+#### `status.get_error_details_vec() -> Vec<ErrorDetail>`
+
+Returns error details as a vector of `ErrorDetail` enum values. Preserves ordering and handles the case where multiple detail messages of the same type are present.
+
+#### `status.check_error_details_vec() -> Result<Vec<ErrorDetail>, DecodeError>`
+
+Like `get_error_details_vec`, but propagates decode errors.
+
+#### Per-type extraction methods
+
+For extracting a single known detail type directly:
+
+```rust
+// Each returns Option<T>
+status.get_details_retry_info()
+status.get_details_debug_info()
+status.get_details_quota_failure()
+status.get_details_error_info()
+status.get_details_precondition_failure()
+status.get_details_bad_request()
+status.get_details_request_info()
+status.get_details_resource_info()
+status.get_details_help()
+status.get_details_localized_message()
+```
+
+## Full example
+
+### Server side
+
+```rust
+use tonic::{Code, Request, Response, Status};
+use tonic_types::{ErrorDetails, StatusExt};
+
+async fn create_user(
+    &self,
+    request: Request<CreateUserRequest>,
+) -> Result<Response<CreateUserResponse>, Status> {
+    let req = request.into_inner();
+    let mut err_details = ErrorDetails::new();
+
+    if req.email.is_empty() {
+        err_details.add_bad_request_violation("email", "must not be empty");
+    }
+    if req.username.len() < 3 {
+        err_details.add_bad_request_violation("username", "must be at least 3 characters");
+    }
+
+    if err_details.has_bad_request_violations() {
+        err_details.set_localized_message("en-US", "The request contained invalid fields.");
+
+        return Err(Status::with_error_details(
+            Code::InvalidArgument,
+            "validation failed",
+            err_details,
+        ));
+    }
+
+    // ... create the user ...
+    Ok(Response::new(CreateUserResponse { id: "new-id".into() }))
+}
+```
+
+### Client side
+
+```rust
+use tonic_types::StatusExt;
+
+match client.create_user(request).await {
+    Ok(response) => { /* handle success */ }
+    Err(status) => {
+        let err_details = status.get_error_details();
+
+        if let Some(bad_request) = err_details.bad_request() {
+            for v in &bad_request.field_violations {
+                eprintln!("Invalid field '{}': {}", v.field, v.description);
+            }
+        }
+
+        if let Some(msg) = err_details.localized_message() {
+            eprintln!("Server message ({}): {}", msg.locale, msg.message);
+        }
+    }
+}
+```
+
+<Note>
+  `StatusExt` is a sealed trait. You don't implement it—you just import it alongside `tonic::Status` and the methods become available automatically.
+</Note>

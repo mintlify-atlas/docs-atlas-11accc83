@@ -1,0 +1,199 @@
+---
+title: 'tonic-health: gRPC health checking service'
+description: 'Implement the standard gRPC health checking protocol in your tonic server with HealthReporter and HealthServer for per-service status reporting.'
+keywords: ['tonic-health', 'grpc', 'health check', 'health reporter', 'grpc.health.v1', 'rust', 'tonic']
+---
+
+`tonic-health` implements the [gRPC Health Checking Protocol](https://github.com/grpc/grpc/blob/master/doc/health-checking.md), which defines a standard `grpc.health.v1.Health` service that clients and infrastructure (load balancers, service meshes) can query to check whether your server is ready to serve traffic.
+
+## Installation
+
+```toml Cargo.toml
+[dependencies]
+tonic-health = "0.14"
+```
+
+## Quick start
+
+```rust src/main.rs
+use tonic::transport::Server;
+use tonic_health::server::health_reporter;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut reporter, health_service) = health_reporter();
+
+    // Mark your service as serving
+    reporter.set_serving::<MyServiceServer<MyService>>().await;
+
+    let addr = "[::1]:50051".parse()?;
+
+    Server::builder()
+        .add_service(health_service)
+        .add_service(MyServiceServer::new(MyService::default()))
+        .serve(addr)
+        .await?;
+
+    Ok(())
+}
+```
+
+## `health_reporter()`
+
+```rust
+pub fn health_reporter() -> (HealthReporter, HealthServer<impl Health>)
+```
+
+Creates a linked `HealthReporter` / `HealthServer` pair. The `HealthServer` implements the `grpc.health.v1.Health` gRPC service and is added directly to your `tonic::Server` with `.add_service()`. The `HealthReporter` is a cloneable handle you use to update per-service statuses at any point during the lifetime of your server.
+
+The server starts with the overall server status (service name `""`) set to `Serving`.
+
+## `HealthReporter`
+
+`HealthReporter` is `Clone` and `Send`, so you can share it across tasks to update service status at runtime.
+
+### `set_serving<S>(&self) -> impl Future`
+
+```rust
+pub async fn set_serving<S>(&self)
+where
+    S: NamedService,
+```
+
+Sets the status of the service `S` to `Serving`. `S` must implement `tonic::server::NamedService`, which all code-generated server types do automatically.
+
+```rust
+reporter.set_serving::<GreeterServer<MyGreeter>>().await;
+```
+
+### `set_not_serving<S>(&self) -> impl Future`
+
+```rust
+pub async fn set_not_serving<S>(&self)
+where
+    S: NamedService,
+```
+
+Sets the status of the service `S` to `NotServing`. Notifies any connected watch stream subscribers immediately.
+
+```rust
+reporter.set_not_serving::<GreeterServer<MyGreeter>>().await;
+```
+
+### `set_service_status<S>(&self, service_name: S, status: ServingStatus) -> impl Future`
+
+```rust
+pub async fn set_service_status<S>(&self, service_name: S, status: ServingStatus)
+where
+    S: AsRef<str>,
+```
+
+Sets status using an arbitrary string service name rather than a type-parameterized `NamedService`. Useful when you need to manage status for services whose types you don't directly reference.
+
+```rust
+reporter
+    .set_service_status("my.package.MyService", ServingStatus::Serving)
+    .await;
+```
+
+### `clear_service_status(&mut self, service_name: &str) -> impl Future`
+
+```rust
+pub async fn clear_service_status(&mut self, service_name: &str)
+```
+
+Removes a service from the reporter's status map entirely. Any active watch streams for that service will receive a stream termination.
+
+```rust
+reporter.clear_service_status("my.package.MyService").await;
+```
+
+## `ServingStatus`
+
+An enum representing the three possible health states for a gRPC service.
+
+```rust
+pub enum ServingStatus {
+    Unknown,
+    Serving,
+    NotServing,
+}
+```
+
+| Variant | Meaning |
+|---|---|
+| `Unknown` | Status could not be determined |
+| `Serving` | The service is up and accepting requests |
+| `NotServing` | The service is down or not accepting requests |
+
+## Protocol details
+
+The health service exposes two RPCs:
+
+- **`Check`** — Unary RPC. Returns the current status of a named service. Returns `NOT_FOUND` if the service name hasn't been registered.
+- **`Watch`** — Server-streaming RPC. Streams status updates whenever the status changes. The stream ends when `clear_service_status` is called for that service.
+
+The special service name `""` (empty string) refers to the overall server health, and is automatically registered as `Serving` when you call `health_reporter()`.
+
+<Note>
+  Querying a service name that was never registered returns a `NOT_FOUND` gRPC status. Call `set_serving` or `set_service_status` before clients can successfully query that name.
+</Note>
+
+## Full example
+
+```rust src/main.rs
+use std::time::Duration;
+use tokio::time::sleep;
+use tonic::transport::Server;
+use tonic_health::server::health_reporter;
+
+// Generated server wrapper (implements NamedService)
+use my_proto::greeter_server::{Greeter, GreeterServer};
+use my_proto::{HelloReply, HelloRequest};
+
+#[derive(Default)]
+struct MyGreeter;
+
+#[tonic::async_trait]
+impl Greeter for MyGreeter {
+    async fn say_hello(
+        &self,
+        request: tonic::Request<HelloRequest>,
+    ) -> Result<tonic::Response<HelloReply>, tonic::Status> {
+        Ok(tonic::Response::new(HelloReply {
+            message: format!("Hello, {}!", request.into_inner().name),
+        }))
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut reporter, health_service) = health_reporter();
+
+    // Register the Greeter as serving
+    reporter.set_serving::<GreeterServer<MyGreeter>>().await;
+
+    // Simulate a service going down after 10 seconds
+    let mut bg_reporter = reporter.clone();
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(10)).await;
+        bg_reporter
+            .set_not_serving::<GreeterServer<MyGreeter>>()
+            .await;
+    });
+
+    let addr = "[::1]:50051".parse()?;
+
+    Server::builder()
+        .add_service(health_service)
+        .add_service(GreeterServer::new(MyGreeter::default()))
+        .serve(addr)
+        .await?;
+
+    Ok(())
+}
+```
+
+<Tip>
+  Because `HealthReporter` is `Clone`, you can pass copies to background tasks or middleware to update service health based on database connectivity, dependency availability, or other runtime conditions.
+</Tip>

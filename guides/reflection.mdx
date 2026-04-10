@@ -1,0 +1,193 @@
+---
+title: "gRPC server reflection with tonic-reflection"
+description: "Expose your service schemas at runtime so tools like grpcurl and Postman can discover and call your APIs without needing the .proto source files."
+keywords: ["tonic", "reflection", "grpc", "tonic-reflection", "grpcurl", "postman", "server reflection"]
+---
+
+gRPC server reflection lets clients query the server at runtime to learn what services and methods are available, what their request and response shapes look like, and how to call them. This is what allows tools like [grpcurl](https://github.com/fullstorydev/grpcurl), [Postman](https://www.postman.com), and [BloomRPC](https://github.com/bloomrpc/bloomrpc) to work against a live server without you handing them your `.proto` files separately. The `tonic-reflection` crate provides a `tonic`-native implementation of the [gRPC Server Reflection protocol](https://github.com/grpc/grpc/blob/master/doc/server-reflection.md).
+
+## Add the dependency
+
+```toml Cargo.toml
+[dependencies]
+tonic = "*"
+tonic-reflection = "0.14"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+```
+
+You also need the build-time support in your build script to emit a file descriptor set alongside the generated code.
+
+## How it works
+
+The reflection service works from a serialized `FileDescriptorSet` — a binary blob that encodes your entire proto schema. You generate this at build time and embed it in your binary. At runtime, the reflection service reads from it to answer schema queries.
+
+<Steps>
+  <Step title="Emit the file descriptor set in build.rs">
+    Pass `file_descriptor_set_path` to your build script so `protoc` also writes out the descriptor set. `tonic-prost-build` exposes this through `configure()`:
+
+    ```rust build.rs
+    fn main() -> Result<(), Box<dyn std::error::Error>> {
+        tonic_prost_build::configure()
+            .file_descriptor_set_path(
+                std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap())
+                    .join("helloworld_descriptor.bin")
+            )
+            .compile_protos(&["proto/helloworld.proto"], &["proto/"])?;
+        Ok(())
+    }
+    ```
+  </Step>
+
+  <Step title="Include the descriptor set in your server binary">
+    Use the `tonic::include_file_descriptor_set!` macro to embed the compiled binary at the name you chose in `build.rs`:
+
+    ```rust
+    mod proto {
+        tonic::include_proto!("helloworld");
+
+        pub(crate) const FILE_DESCRIPTOR_SET: &[u8] =
+            tonic::include_file_descriptor_set!("helloworld_descriptor");
+    }
+    ```
+  </Step>
+
+  <Step title="Build the reflection service">
+    Pass the embedded descriptor bytes to the builder and call `build_v1()`:
+
+    ```rust
+    let reflection_service = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
+        .build_v1()
+        .unwrap();
+    ```
+  </Step>
+
+  <Step title="Add the reflection service to your server">
+    Register it alongside your application services:
+
+    ```rust
+    Server::builder()
+        .add_service(reflection_service)
+        .add_service(proto::greeter_server::GreeterServer::new(greeter))
+        .serve(addr)
+        .await?;
+    ```
+  </Step>
+</Steps>
+
+## Complete server example
+
+This is the full example from `examples/src/reflection/server.rs`:
+
+```rust
+use tonic::transport::Server;
+use tonic::{Request, Response, Status};
+
+mod proto {
+    tonic::include_proto!("helloworld");
+
+    pub(crate) const FILE_DESCRIPTOR_SET: &[u8] =
+        tonic::include_file_descriptor_set!("helloworld_descriptor");
+}
+
+#[derive(Default)]
+pub struct MyGreeter {}
+
+#[tonic::async_trait]
+impl proto::greeter_server::Greeter for MyGreeter {
+    async fn say_hello(
+        &self,
+        request: Request<proto::HelloRequest>,
+    ) -> Result<Response<proto::HelloReply>, Status> {
+        let reply = proto::HelloReply {
+            message: format!("Hello {}!", request.into_inner().name),
+        };
+        Ok(Response::new(reply))
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let reflection_service = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
+        .build_v1()
+        .unwrap();
+
+    let addr = "[::1]:50052".parse().unwrap();
+    let greeter = MyGreeter::default();
+
+    Server::builder()
+        .add_service(reflection_service)
+        .add_service(proto::greeter_server::GreeterServer::new(greeter))
+        .serve(addr)
+        .await?;
+
+    Ok(())
+}
+```
+
+## Builder options
+
+<CardGroup cols={2}>
+  <Card title="register_encoded_file_descriptor_set" icon="binary">
+    Register one or more raw byte slices containing an encoded `FileDescriptorSet`. Call this multiple times to include descriptors from several proto packages.
+  </Card>
+  <Card title="register_file_descriptor_set" icon="file">
+    Register a decoded `prost_types::FileDescriptorSet` directly if you already have one in memory.
+  </Card>
+  <Card title="with_service_name" icon="tag">
+    Explicitly list which fully-qualified service names to advertise. If not called, all services in the registered descriptors are advertised automatically.
+  </Card>
+  <Card title="include_reflection_service" icon="eye">
+    Controls whether the reflection service itself is included in its own listing. Defaults to `true`.
+  </Card>
+</CardGroup>
+
+## Protocol versions
+
+The builder provides two build methods:
+
+| Method | Protocol version | Use when |
+|---|---|---|
+| `build_v1()` | `grpc.reflection.v1` | Default for all modern tooling |
+| `build_v1alpha()` | `grpc.reflection.v1alpha` | Older clients that do not speak v1 yet |
+
+You can add both to the same server if you need to support both versions simultaneously.
+
+```rust
+let v1 = tonic_reflection::server::Builder::configure()
+    .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
+    .build_v1()
+    .unwrap();
+
+let v1alpha = tonic_reflection::server::Builder::configure()
+    .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
+    .build_v1alpha()
+    .unwrap();
+
+Server::builder()
+    .add_service(v1)
+    .add_service(v1alpha)
+    .add_service(proto::greeter_server::GreeterServer::new(greeter))
+    .serve(addr)
+    .await?;
+```
+
+## Testing with grpcurl
+
+Once reflection is enabled, you can use grpcurl without providing a proto file:
+
+```bash
+# List all services
+grpcurl -plaintext '[::1]:50052' list
+
+# Describe a service
+grpcurl -plaintext '[::1]:50052' describe helloworld.Greeter
+
+# Call a method
+grpcurl -plaintext -d '{"name": "Tonic"}' '[::1]:50052' helloworld.Greeter/SayHello
+```
+
+<Note>
+  The `FILE_DESCRIPTOR_SET` constant is a `&[u8]` containing the binary-encoded protobuf descriptor. It is embedded directly in your binary at compile time by the `include_file_descriptor_set!` macro, so there is no file I/O at runtime.
+</Note>

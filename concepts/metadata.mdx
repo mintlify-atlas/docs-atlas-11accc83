@@ -1,0 +1,257 @@
+---
+title: 'gRPC metadata in tonic'
+description: 'How gRPC metadata maps to HTTP/2 headers in tonic, including MetadataMap, ASCII and binary keys, and patterns for auth tokens and tracing.'
+---
+
+gRPC metadata is key-value data sent alongside an RPC, separate from the message payload. It maps directly to HTTP/2 headers: initial metadata arrives with the request headers, and trailing metadata arrives with the response trailers. Tonic exposes metadata through `MetadataMap`, which is backed by an `http::HeaderMap`.
+
+## MetadataMap
+
+`tonic::metadata::MetadataMap` is the central type for working with metadata. It's available on both `Request<T>` and `Response<T>`.
+
+```rust
+use tonic::metadata::MetadataMap;
+
+let mut map = MetadataMap::new();
+
+// Insert an ASCII value
+map.insert("x-request-id", "abc-123".parse().unwrap());
+
+// Insert a binary value (key must end in "-bin")
+map.insert_bin("trace-proto-bin", tonic::metadata::MetadataValue::from_bytes(b"[binary data]"));
+
+assert!(map.contains_key("x-request-id"));
+assert_eq!(map.get("x-request-id").unwrap(), "abc-123");
+
+map.remove("x-request-id");
+```
+
+<Note>
+The following header names are reserved by the gRPC protocol and will be stripped when metadata is converted to HTTP/2 headers: `te`, `content-type`, `grpc-message`, `grpc-message-type`, and `grpc-status`.
+</Note>
+
+## ASCII vs binary metadata
+
+gRPC metadata comes in two forms depending on the key name.
+
+<Tabs>
+  <Tab title="ASCII metadata">
+    Keys that do **not** end in `-bin` hold printable ASCII values. The key type is `MetadataKey<Ascii>`, also exported as `AsciiMetadataKey`. Values are `MetadataValue<Ascii>` / `AsciiMetadataValue`.
+
+    ```rust
+    use tonic::metadata::{AsciiMetadataKey, MetadataValue};
+
+    let key = AsciiMetadataKey::from_static("x-correlation-id");
+    let value: MetadataValue<_> = "req-42".parse().unwrap();
+
+    map.insert(key, value);
+    ```
+
+    ASCII values are transmitted as-is in HTTP/2 headers.
+  </Tab>
+  <Tab title="Binary metadata">
+    Keys ending in `-bin` hold arbitrary bytes. The key type is `MetadataKey<Binary>` / `BinaryMetadataKey`. Values are `MetadataValue<Binary>` / `BinaryMetadataValue`.
+
+    ```rust
+    use tonic::metadata::{BinaryMetadataKey, MetadataValue};
+
+    let key = BinaryMetadataKey::from_static("trace-proto-bin");
+    let value = MetadataValue::from_bytes(b"\x00\x01\x02");
+
+    map.insert_bin(key, value);
+    ```
+
+    Binary values are base64-encoded before being placed in HTTP/2 headers and decoded on the receiving end automatically.
+  </Tab>
+</Tabs>
+
+## Reading metadata from a request (server side)
+
+Inside a service handler, call `request.metadata()` to get a shared reference to the incoming metadata map:
+
+```rust
+#[tonic::async_trait]
+impl Greeter for MyGreeter {
+    async fn say_hello(
+        &self,
+        request: Request<HelloRequest>,
+    ) -> Result<Response<HelloReply>, Status> {
+        // Read an ASCII header
+        if let Some(token) = request.metadata().get("authorization") {
+            let token_str = token.to_str()
+                .map_err(|_| Status::unauthenticated("invalid authorization header"))?;
+            validate_token(token_str)?;
+        }
+
+        let reply = HelloReply {
+            message: format!("Hello {}!", request.into_inner().name),
+        };
+        Ok(Response::new(reply))
+    }
+}
+```
+
+Use `metadata().get_bin("key-bin")` for binary metadata:
+
+```rust
+if let Some(value) = request.metadata().get_bin("trace-proto-bin") {
+    let bytes = value.to_bytes()?;
+    // decode trace context from bytes
+}
+```
+
+## Sending metadata from a client
+
+Before making a call, attach metadata to the request using `request.metadata_mut()`:
+
+```rust
+use tonic::Request;
+
+let mut request = Request::new(HelloRequest { name: "Tonic".into() });
+
+request
+    .metadata_mut()
+    .insert("authorization", "Bearer my-token".parse().unwrap());
+
+request
+    .metadata_mut()
+    .insert("x-request-id", "req-001".parse().unwrap());
+
+let response = client.say_hello(request).await?;
+```
+
+You can also attach metadata inside a client interceptor so it applies to every outbound call:
+
+```rust
+use tonic::{Request, Status, service::Interceptor};
+
+struct AuthInterceptor {
+    token: String,
+}
+
+impl Interceptor for AuthInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        let value = format!("Bearer {}", self.token).parse()
+            .map_err(|_| Status::internal("invalid token"))?;
+        request.metadata_mut().insert("authorization", value);
+        Ok(request)
+    }
+}
+
+// Attach to the generated client:
+let client = GreeterClient::with_interceptor(channel, AuthInterceptor {
+    token: "my-secret".into(),
+});
+```
+
+## Sending metadata from a server in the response
+
+Build a `Response` and mutate its metadata before returning it:
+
+```rust
+async fn say_hello(
+    &self,
+    request: Request<HelloRequest>,
+) -> Result<Response<HelloReply>, Status> {
+    let reply = HelloReply {
+        message: format!("Hello {}!", request.into_inner().name),
+    };
+
+    let mut response = Response::new(reply);
+    response
+        .metadata_mut()
+        .insert("x-server-version", "1.2.3".parse().unwrap());
+
+    Ok(response)
+}
+```
+
+## Common patterns
+
+<AccordionGroup>
+  <Accordion title="Passing authentication tokens">
+    The standard gRPC convention is to use the `authorization` HTTP header:
+
+    ```rust
+    // Client
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {token}").parse().unwrap(),
+    );
+
+    // Server
+    let token = request
+        .metadata()
+        .get("authorization")
+        .ok_or_else(|| Status::unauthenticated("missing authorization"))?
+        .to_str()
+        .map_err(|_| Status::unauthenticated("invalid authorization header"))?;
+    ```
+  </Accordion>
+  <Accordion title="Propagating request IDs">
+    Use a custom header to carry a correlation ID for log tracing across services:
+
+    ```rust
+    // Generate or forward an ID
+    let request_id = incoming_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    request.metadata_mut().insert(
+        "x-request-id",
+        request_id.parse().unwrap(),
+    );
+    ```
+  </Accordion>
+  <Accordion title="Tracing headers">
+    For distributed tracing (e.g., OpenTelemetry W3C Trace Context), propagate binary or ASCII trace headers:
+
+    ```rust
+    // Inject trace context into outbound request
+    request.metadata_mut().insert(
+        "traceparent",
+        "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+            .parse()
+            .unwrap(),
+    );
+
+    // Extract on the server side
+    if let Some(traceparent) = request.metadata().get("traceparent") {
+        let value = traceparent.to_str().unwrap_or("");
+        // parse and continue the trace span
+    }
+    ```
+  </Accordion>
+  <Accordion title="Setting a request timeout">
+    `Request::set_timeout` writes the `grpc-timeout` header using the most precise unit that fits in 8 digits, as required by the gRPC spec:
+
+    ```rust
+    use std::time::Duration;
+    use tonic::Request;
+
+    let mut request = Request::new(HelloRequest { name: "Tonic".into() });
+    request.set_timeout(Duration::from_secs(30));
+
+    // The metadata now contains: grpc-timeout: 30000000u
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## MetadataMap API reference
+
+| Method | Description |
+|--------|-------------|
+| `map.get("key")` | Get an ASCII value by key. Returns `Option<&MetadataValue<Ascii>>`. |
+| `map.get_bin("key-bin")` | Get a binary value by key. |
+| `map.insert("key", value)` | Insert or replace an ASCII value. |
+| `map.insert_bin("key-bin", value)` | Insert or replace a binary value. |
+| `map.append("key", value)` | Append an additional value under an existing key. |
+| `map.remove("key")` | Remove all values for a key. |
+| `map.contains_key("key")` | Check if a key exists. |
+| `map.is_empty()` | Check if the map has no entries. |
+| `map.len()` | Total number of values (not keys). |
+| `map.iter()` | Iterate over `KeyAndValueRef` variants. |
+| `MetadataMap::from_headers(header_map)` | Convert from `http::HeaderMap`. |
+| `map.into_headers()` | Convert back to `http::HeaderMap`. |
+
+<Warning>
+Keys are always lowercased. Attempting to set a key with uppercase characters will result in an `InvalidMetadataKey` error at parse time.
+</Warning>

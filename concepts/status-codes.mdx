@@ -1,0 +1,345 @@
+---
+title: 'Status codes and error handling in tonic'
+description: 'A complete reference for tonic::Status and the gRPC Code enum, with guidance on creating errors, attaching metadata, and handling rich error details.'
+---
+
+Every gRPC RPC returns a status that indicates whether the call succeeded or failed. In tonic, this is represented by `tonic::Status`, which carries a `Code`, a human-readable message, optional binary details, and optional metadata. Service methods return `Result<Response<T>, Status>`, so returning `Err(Status::...)` is the standard way to signal an error to the client.
+
+## The Status type
+
+`Status` is defined in `tonic/src/status.rs` and contains four fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `code` | `Code` | The gRPC status code. |
+| `message` | `String` | A human-readable error description. Sent in the `grpc-message` header. |
+| `details` | `Bytes` | Opaque binary data. Sent base64-encoded in `grpc-status-details-bin`. |
+| `metadata` | `MetadataMap` | Custom headers attached to the error. |
+
+On the wire, status is carried in HTTP/2 trailers (`grpc-status`, `grpc-message`, `grpc-status-details-bin`).
+
+## Creating a Status
+
+<Steps>
+  <Step title="Use a named constructor">
+    The most ergonomic approach for common error codes:
+
+    ```rust
+    use tonic::Status;
+
+    return Err(Status::not_found("user not found"));
+    return Err(Status::invalid_argument("name cannot be empty"));
+    return Err(Status::unauthenticated("missing or invalid token"));
+    return Err(Status::permission_denied("insufficient scope"));
+    return Err(Status::internal("unexpected database error"));
+    return Err(Status::unavailable("service is overloaded, retry with backoff"));
+    ```
+  </Step>
+  <Step title="Use Status::new for any code">
+    ```rust
+    use tonic::{Code, Status};
+
+    let status = Status::new(Code::FailedPrecondition, "account is suspended");
+    ```
+  </Step>
+  <Step title="Attach binary details">
+    ```rust
+    use bytes::Bytes;
+    use tonic::{Code, Status};
+
+    let details = Bytes::from(b"serialized protobuf".as_ref());
+    let status = Status::with_details(
+        Code::InvalidArgument,
+        "request validation failed",
+        details,
+    );
+    ```
+  </Step>
+  <Step title="Attach metadata">
+    ```rust
+    use tonic::{Code, Status};
+    use tonic::metadata::MetadataMap;
+
+    let mut metadata = MetadataMap::new();
+    metadata.insert("x-retry-after", "30".parse().unwrap());
+
+    let status = Status::with_metadata(Code::ResourceExhausted, "rate limit exceeded", metadata);
+    ```
+  </Step>
+</Steps>
+
+## All gRPC status codes
+
+The `Code` enum has 17 variants with integer values 0–16. Codes not listed in an RPC response or received with an unrecognized integer value are treated as `Unknown`.
+
+<AccordionGroup>
+  <Accordion title="Ok (0)">
+    The operation completed successfully. Not typically used as an error — it's the implicit result of a successful RPC.
+
+    ```rust
+    Status::ok("operation succeeded")
+    ```
+
+    <Note>A successful RPC does not send a `Status::ok()` from the handler. Returning `Ok(Response::new(...))` produces a `grpc-status: 0` trailer automatically.</Note>
+  </Accordion>
+
+  <Accordion title="Cancelled (1)">
+    The operation was cancelled, typically by the caller. Tonic maps `h2::Reason::CANCEL` to this code automatically.
+
+    ```rust
+    Status::cancelled("request cancelled by client")
+    ```
+  </Accordion>
+
+  <Accordion title="Unknown (2)">
+    Unknown error. Used when a `Status` from another address space has an unrecognized code, or when an error doesn't provide enough information to classify.
+
+    ```rust
+    Status::unknown("an unknown error occurred")
+    ```
+  </Accordion>
+
+  <Accordion title="InvalidArgument (3)">
+    The client supplied an invalid argument — one that is problematic regardless of system state (e.g., a malformed field value). Distinct from `FailedPrecondition`.
+
+    ```rust
+    Status::invalid_argument("field 'email' is not a valid address")
+    ```
+  </Accordion>
+
+  <Accordion title="DeadlineExceeded (4)">
+    The deadline expired before the operation completed. May be returned even if the operation eventually succeeded on the server side.
+
+    ```rust
+    Status::deadline_exceeded("operation took longer than allowed deadline")
+    ```
+  </Accordion>
+
+  <Accordion title="NotFound (5)">
+    The requested entity was not found. Use for individual lookups; prefer `Unimplemented` for missing methods.
+
+    ```rust
+    Status::not_found("user with id '42' not found")
+    ```
+  </Accordion>
+
+  <Accordion title="AlreadyExists (6)">
+    An entity that the client tried to create already exists.
+
+    ```rust
+    Status::already_exists("an account with this email already exists")
+    ```
+  </Accordion>
+
+  <Accordion title="PermissionDenied (7)">
+    The caller is authenticated but does not have permission to perform the operation. Do not use for unauthenticated callers (`Unauthenticated`) or exhausted resources (`ResourceExhausted`).
+
+    ```rust
+    Status::permission_denied("caller lacks 'admin' role")
+    ```
+  </Accordion>
+
+  <Accordion title="ResourceExhausted (8)">
+    A resource quota has been exceeded — per-user limits, rate limits, or disk space. Tonic maps `h2::Reason::ENHANCE_YOUR_CALM` here.
+
+    ```rust
+    Status::resource_exhausted("API rate limit exceeded, retry after 60s")
+    ```
+  </Accordion>
+
+  <Accordion title="FailedPrecondition (9)">
+    The system is not in the state required for the operation. The client should not retry until it has fixed the precondition.
+
+    Use this (not `Aborted` or `Unavailable`) when:
+    - An `rmdir` fails because the directory is non-empty
+    - A read operation is attempted on a non-readable resource
+
+    ```rust
+    Status::failed_precondition("directory must be empty before deletion")
+    ```
+  </Accordion>
+
+  <Accordion title="Aborted (10)">
+    The operation was aborted, typically due to a concurrency issue like a transaction conflict or sequencer check failure. The client should retry at a higher level (e.g., restart a read-modify-write sequence).
+
+    ```rust
+    Status::aborted("transaction aborted due to conflict, please retry")
+    ```
+  </Accordion>
+
+  <Accordion title="OutOfRange (11)">
+    The operation was attempted past the valid range (e.g., reading past end of file). Unlike `InvalidArgument`, this may resolve when system state changes.
+
+    ```rust
+    Status::out_of_range("offset 1024 exceeds file size 512")
+    ```
+  </Accordion>
+
+  <Accordion title="Unimplemented (12)">
+    The operation is not implemented, supported, or enabled in this service.
+
+    ```rust
+    Status::unimplemented("method GetFeature not implemented")
+    ```
+  </Accordion>
+
+  <Accordion title="Internal (13)">
+    An internal invariant was broken. Indicates something is seriously wrong. Tonic maps several HTTP/2 errors (e.g., `NO_ERROR`, `PROTOCOL_ERROR`) to this code.
+
+    ```rust
+    Status::internal("invariant violated: unexpected nil pointer")
+    ```
+  </Accordion>
+
+  <Accordion title="Unavailable (14)">
+    The service is temporarily unavailable — a transient condition that may resolve on retry with backoff. Tonic maps connection failures and `h2::Reason::REFUSED_STREAM` here.
+
+    ```rust
+    Status::unavailable("service is starting up, please retry")
+    ```
+  </Accordion>
+
+  <Accordion title="DataLoss (15)">
+    Unrecoverable data loss or corruption.
+
+    ```rust
+    Status::data_loss("checksum mismatch: stored data may be corrupted")
+    ```
+  </Accordion>
+
+  <Accordion title="Unauthenticated (16)">
+    The request does not have valid authentication credentials. Use this when the caller cannot be identified. Use `PermissionDenied` when the caller is known but lacks permission.
+
+    ```rust
+    Status::unauthenticated("valid credentials are required")
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Returning errors from service methods
+
+Return `Err(Status)` from any handler to end the RPC with an error:
+
+```rust
+#[tonic::async_trait]
+impl UserService for MyUserService {
+    async fn get_user(
+        &self,
+        request: Request<GetUserRequest>,
+    ) -> Result<Response<User>, Status> {
+        let id = request.into_inner().id;
+
+        if id.is_empty() {
+            return Err(Status::invalid_argument("user id cannot be empty"));
+        }
+
+        match self.db.find_user(&id).await {
+            Ok(Some(user)) => Ok(Response::new(user)),
+            Ok(None) => Err(Status::not_found(format!("user '{id}' not found"))),
+            Err(e) => {
+                // Log the internal error, don't expose details to the client
+                tracing::error!("database error: {e}");
+                Err(Status::internal("internal server error"))
+            }
+        }
+    }
+}
+```
+
+The `?` operator works with any error type that implements `Into<Status>`. Tonic provides `From<std::io::Error>` for `Status`, mapping common `ErrorKind` values to appropriate codes (e.g., `NotFound` → `Code::NotFound`, `TimedOut` → `Code::DeadlineExceeded`).
+
+## Attaching metadata to a Status
+
+Metadata on a `Status` is sent as additional HTTP/2 trailers alongside the standard `grpc-status` and `grpc-message` headers. This is useful for retry hints or diagnostic information:
+
+```rust
+use tonic::{Code, Status};
+use tonic::metadata::MetadataMap;
+
+let mut metadata = MetadataMap::new();
+metadata.insert("x-retry-after", "30".parse().unwrap());
+metadata.insert("x-request-id", "req-abc-123".parse().unwrap());
+
+let status = Status::with_metadata(
+    Code::ResourceExhausted,
+    "rate limit exceeded",
+    metadata,
+);
+```
+
+Read it back on the client after an error:
+
+```rust
+match client.get_user(request).await {
+    Ok(response) => { /* ... */ }
+    Err(status) => {
+        if let Some(retry_after) = status.metadata().get("x-retry-after") {
+            let secs: u64 = retry_after.to_str().unwrap_or("0").parse().unwrap_or(0);
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        }
+    }
+}
+```
+
+## Converting to and from HTTP status codes
+
+Tonic maps HTTP status codes to gRPC codes when there is no `grpc-status` trailer present (e.g., when a proxy or load balancer returns an HTTP error):
+
+| HTTP status | gRPC Code |
+|-------------|-----------|
+| 400 Bad Request | `Internal` |
+| 401 Unauthorized | `Unauthenticated` |
+| 403 Forbidden | `PermissionDenied` |
+| 404 Not Found | `Unimplemented` |
+| 429 / 502 / 503 / 504 | `Unavailable` |
+
+You can also convert a `Status` to an HTTP response:
+
+```rust
+let status = Status::not_found("resource not found");
+let http_response: http::Response<()> = status.into_http();
+```
+
+## Rich error details with tonic-types
+
+The `details` field on `Status` carries an opaque byte blob intended to hold a serialized [`google.rpc.Status`](https://cloud.google.com/apis/design/errors) proto with typed error detail messages. The [`tonic-types`](https://docs.rs/tonic-types) crate provides `StatusExt` and `ErrorDetails` for constructing and reading these structured errors:
+
+```rust
+use tonic::{Code, Status};
+use tonic_types::{ErrorDetails, StatusExt};
+
+let mut err_details = ErrorDetails::new();
+err_details.add_bad_request_violation("name", "name cannot be empty");
+err_details
+    .add_help_link("documentation", "https://example.com/docs/names")
+    .set_localized_message("en-US", "The name field is required.");
+
+let status = Status::with_error_details(
+    Code::InvalidArgument,
+    "request contains invalid arguments",
+    err_details,
+);
+
+return Err(status);
+```
+
+On the client side, extract the structured details:
+
+```rust
+match client.say_hello(request).await {
+    Err(status) => {
+        if let Ok(details) = status.get_error_details() {
+            if let Some(bad_request) = details.bad_request() {
+                for violation in &bad_request.field_violations {
+                    eprintln!("Field '{}': {}", violation.field, violation.description);
+                }
+            }
+        }
+    }
+    Ok(response) => { /* ... */ }
+}
+```
+
+<Tip>
+Use `tonic-types` whenever you want clients to programmatically inspect why a request failed — for example, to surface field-level validation errors in a UI.
+</Tip>

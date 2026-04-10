@@ -1,0 +1,397 @@
+---
+title: 'tonic-build: gRPC code generation for Rust'
+description: 'Generate gRPC client and server stubs from protobuf definitions or pure Rust service descriptors using tonic-build and tonic-prost-build.'
+keywords: ['tonic-build', 'grpc', 'codegen', 'protobuf', 'prost', 'rust', 'build script']
+---
+
+`tonic-build` provides the core traits and infrastructure for generating gRPC client and server code in Rust. For projects using `.proto` files, the companion crate `tonic-prost-build` wraps `prost-build` to drive code generation from your `build.rs` script. For projects that want to skip protobuf entirely, the `manual` module lets you define services and methods directly in Rust.
+
+## Installation
+
+<CodeGroup>
+
+```toml Cargo.toml (protobuf workflow)
+[dependencies]
+tonic = "0.14"
+prost = "0.14"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+```
+
+```toml Cargo.toml (manual workflow)
+[dependencies]
+tonic = "0.14"
+
+[build-dependencies]
+tonic-build = "0.14"
+```
+
+</CodeGroup>
+
+## Compiling `.proto` files with tonic-prost-build
+
+`tonic-prost-build` compiles your `.proto` definitions and generates matching Rust structs, client stubs, and server trait implementations. You call it from your `build.rs` file.
+
+### Quick start
+
+```rust build.rs
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tonic_prost_build::compile_protos("proto/service.proto")?;
+    Ok(())
+}
+```
+
+`compile_protos` uses the parent directory of the proto file as the include path. For more control, use `configure()`.
+
+### `compile_protos(proto: impl AsRef<Path>) -> io::Result<()>`
+
+Compiles a single `.proto` file. The include directory is inferred as the parent folder of the given path.
+
+### `configure() -> Builder`
+
+Returns a `Builder` that lets you customize code generation before calling `.compile_protos()`.
+
+```rust build.rs
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tonic_prost_build::configure()
+        .build_server(false)
+        .compile_protos(
+            &["proto/helloworld/helloworld.proto"],
+            &["proto/helloworld"],
+        )?;
+    Ok(())
+}
+```
+
+<AccordionGroup>
+  <Accordion title="Builder methods">
+
+| Method | Default | Description |
+|---|---|---|
+| `build_client(bool)` | `true` | Generate client stubs |
+| `build_server(bool)` | `true` | Generate server trait and wrapper |
+| `build_transport(bool)` | `true` | Include `connect()` method using `tonic::transport::Channel` |
+| `out_dir(path)` | `OUT_DIR` | Directory where generated files are written |
+| `extern_path(proto, rust)` | — | Map a proto package to an existing Rust path |
+| `field_attribute(path, attr)` | — | Attach a Rust attribute to matched fields |
+| `message_attribute(path, attr)` | — | Attach a Rust attribute to matched messages |
+| `enum_attribute(path, attr)` | — | Attach a Rust attribute to matched enums |
+| `type_attribute(path, attr)` | — | Attach a Rust attribute to matched types |
+| `server_attribute(path, attr)` | — | Attach an attribute to matched server structs |
+| `client_attribute(path, attr)` | — | Attach an attribute to matched client structs |
+| `server_mod_attribute(path, attr)` | — | Attach an attribute to server `mod` items |
+| `client_mod_attribute(path, attr)` | — | Attach an attribute to client `mod` items |
+| `trait_attribute(path, attr)` | — | Attach an attribute to matched service traits |
+| `proto_path(path)` | `"super"` | Module path where generated protobuf types live |
+| `compile_well_known_types(bool)` | `false` | Compile well-known types instead of using `prost-types` |
+| `file_descriptor_set_path(path)` | — | Write a file descriptor set for use with reflection |
+| `emit_package(bool)` | `true` | Emit package name in generated code |
+| `use_arc_self(bool)` | `false` | Use `Arc<Self>` instead of `&self` in service traits |
+| `generate_default_stubs(bool)` | `false` | Generate `unimplemented!` stubs for all service methods |
+| `codec_path(path)` | `tonic_prost::ProstCodec` | Custom codec type to use |
+| `disable_comments(iter)` | — | Suppress doc comments for matched proto paths |
+
+  </Accordion>
+</AccordionGroup>
+
+### Using the generated code
+
+After compilation, include the generated output in your crate:
+
+```rust src/main.rs
+pub mod helloworld {
+    tonic::include_proto!("helloworld");
+}
+
+use helloworld::greeter_client::GreeterClient;
+use helloworld::HelloRequest;
+```
+
+## Core traits
+
+`tonic-build` defines two traits that both the prost and manual workflows implement. You can also implement them yourself to plug in a custom codegen backend.
+
+### `Service` trait
+
+Represents a gRPC service definition. Implemented by both `tonic_prost_build` (via prost) and `tonic_build::manual::Service`.
+
+```rust
+pub trait Service {
+    type Comment: AsRef<str>;
+    type Method: Method;
+
+    fn name(&self) -> &str;
+    fn package(&self) -> &str;
+    fn identifier(&self) -> &str;
+    fn methods(&self) -> &[Self::Method];
+    fn comment(&self) -> &[Self::Comment];
+}
+```
+
+<AccordionGroup>
+  <Accordion title="Service trait methods">
+
+<ParamField path="name" type="&str">
+  The service name in Rust style (e.g. `"Greeter"`).
+</ParamField>
+
+<ParamField path="package" type="&str">
+  The proto package name (e.g. `"helloworld"`). Used to build the route path `/<package>.<Service>/<Method>`.
+</ParamField>
+
+<ParamField path="identifier" type="&str">
+  Identifier used to generate Rust type names. Often equal to `name`.
+</ParamField>
+
+<ParamField path="methods" type="&[Self::Method]">
+  Slice of methods belonging to this service.
+</ParamField>
+
+<ParamField path="comment" type="&[Self::Comment]">
+  Documentation comments extracted from the proto file or set manually.
+</ParamField>
+
+  </Accordion>
+</AccordionGroup>
+
+### `Method` trait
+
+Represents a single RPC method within a service.
+
+```rust
+pub trait Method {
+    type Comment: AsRef<str>;
+
+    fn name(&self) -> &str;
+    fn identifier(&self) -> &str;
+    fn codec_path(&self) -> &str;
+    fn client_streaming(&self) -> bool;
+    fn server_streaming(&self) -> bool;
+    fn comment(&self) -> &[Self::Comment];
+    fn deprecated(&self) -> bool;
+    fn request_response_name(
+        &self,
+        proto_path: &str,
+        compile_well_known_types: bool,
+    ) -> (TokenStream, TokenStream);
+}
+```
+
+<AccordionGroup>
+  <Accordion title="Method trait fields">
+
+<ParamField path="name" type="&str">
+  The method name in snake_case Rust style (e.g. `"say_hello"`).
+</ParamField>
+
+<ParamField path="identifier" type="&str">
+  The route name used in the gRPC path, typically PascalCase (e.g. `"SayHello"`).
+</ParamField>
+
+<ParamField path="codec_path" type="&str">
+  Path to the `Codec` implementation to use for this method.
+</ParamField>
+
+<ParamField path="client_streaming" type="bool">
+  Whether the client streams multiple messages to the server.
+</ParamField>
+
+<ParamField path="server_streaming" type="bool">
+  Whether the server streams multiple messages back to the client.
+</ParamField>
+
+<ParamField path="deprecated" type="bool">
+  Whether this method is marked deprecated. Defaults to `false`.
+</ParamField>
+
+<ParamField path="request_response_name" type="(TokenStream, TokenStream)">
+  Returns the fully-qualified Rust type paths for the request and response types, given `proto_path` and whether well-known types should be compiled.
+</ParamField>
+
+  </Accordion>
+</AccordionGroup>
+
+## `CodeGenBuilder`
+
+`CodeGenBuilder` is the low-level code generation driver. It consumes a `Service` implementation and produces `TokenStream` output for client and server code. Both `tonic-prost-build` and `tonic_build::manual` use it internally.
+
+```rust
+let mut builder = CodeGenBuilder::new();
+builder
+    .emit_package(true)
+    .build_transport(true)
+    .generate_default_stubs(false)
+    .use_arc_self(false);
+
+let client_tokens = builder.generate_client(&my_service, "super");
+let server_tokens = builder.generate_server(&my_service, "super");
+```
+
+<AccordionGroup>
+  <Accordion title="CodeGenBuilder methods">
+
+| Method | Default | Description |
+|---|---|---|
+| `emit_package(bool)` | `true` | Include the proto package name in generated route paths |
+| `attributes(Attributes)` | empty | Custom attributes to attach to generated `mod`, `struct`, and `trait` items |
+| `build_transport(bool)` | `true` | Emit transport code (requires `tonic/transport` feature) |
+| `compile_well_known_types(bool)` | `false` | Compile well-known types rather than using `prost-types` |
+| `disable_comments(HashSet<String>)` | empty | Suppress doc comments for matched paths |
+| `use_arc_self(bool)` | `false` | Emit `Arc<Self>` instead of `&self` in server trait |
+| `generate_default_stubs(bool)` | `false` | Generate `unimplemented!` body for each service method |
+| `generate_client(&service, proto_path)` | — | Returns a `TokenStream` for the client module |
+| `generate_server(&service, proto_path)` | — | Returns a `TokenStream` for the server module |
+
+  </Accordion>
+</AccordionGroup>
+
+## `Attributes`
+
+`Attributes` lets you attach Rust attributes (like derives or cfg flags) to generated `mod`, `struct`, and `trait` items by matching on proto path patterns.
+
+```rust
+let mut attrs = Attributes::default();
+
+// Apply to all items in a proto package
+attrs.push_mod("my.proto.package", r#"#[cfg(feature = "server")]"#);
+
+// Apply to a specific generated struct
+attrs.push_struct("EchoService", "#[derive(PartialEq)]");
+
+// Apply to a generated service trait
+attrs.push_trait("Server", "#[mockall::automock]");
+```
+
+### Pattern matching
+
+Patterns match against fully-qualified proto names (e.g. `.my.protos.Service`):
+
+- `"."` — matches everything
+- `".my"` — prefix match: matches `.my` and anything under it
+- `"Service"` — suffix match: matches any path ending in `Service`
+- `".my.protos.Service"` — exact match
+
+<ParamField path="push_mod(pattern, attr)" type="method">
+  Attach `attr` to generated `mod` items whose proto path matches `pattern`.
+</ParamField>
+
+<ParamField path="push_struct(pattern, attr)" type="method">
+  Attach `attr` to generated `struct` items whose proto path matches `pattern`.
+</ParamField>
+
+<ParamField path="push_trait(pattern, attr)" type="method">
+  Attach `attr` to generated `trait` items whose proto path matches `pattern`.
+</ParamField>
+
+## The `manual` module
+
+The `manual` module lets you define gRPC services in Rust without any `.proto` files. This is useful when you want to use a custom serialization codec, or when you want to avoid the protobuf toolchain entirely.
+
+### Defining a service
+
+```rust build.rs
+use tonic_build::manual::{Builder, Method, Service};
+
+fn main() {
+    let greeter = Service::builder()
+        .name("Greeter")
+        .package("helloworld")
+        .method(
+            Method::builder()
+                .name("say_hello")
+                .route_name("SayHello")
+                .input_type("crate::HelloRequest")
+                .output_type("crate::HelloResponse")
+                .codec_path("crate::JsonCodec")
+                .build(),
+        )
+        .build();
+
+    Builder::new().compile(&[greeter]);
+}
+```
+
+Generated files are written to `OUT_DIR` with filenames like `<package>.<ServiceName>.rs`.
+
+### `manual::ServiceBuilder`
+
+<ParamField path="name(impl AsRef<str>)" type="builder method" required>
+  Service name in Rust style. Used as the base for generated type names and the route `/<package>.<name>/<method>`.
+</ParamField>
+
+<ParamField path="package(impl AsRef<str>)" type="builder method" required>
+  Proto package name. Used in route construction.
+</ParamField>
+
+<ParamField path="comment(impl AsRef<str>)" type="builder method">
+  Adds a doc comment line to the generated service.
+</ParamField>
+
+<ParamField path="method(Method)" type="builder method">
+  Adds a method to the service. Call multiple times for multiple methods.
+</ParamField>
+
+### `manual::MethodBuilder`
+
+<ParamField path="name(impl AsRef<str>)" type="builder method" required>
+  Method name in snake_case. Used for the generated client function name.
+</ParamField>
+
+<ParamField path="route_name(impl AsRef<str>)" type="builder method" required>
+  Route name in PascalCase. Appears in the gRPC path as `/<package>.<Service>/<route_name>`.
+</ParamField>
+
+<ParamField path="input_type(impl AsRef<str>)" type="builder method" required>
+  Full Rust path to the request type (e.g. `"crate::HelloRequest"`).
+</ParamField>
+
+<ParamField path="output_type(impl AsRef<str>)" type="builder method" required>
+  Full Rust path to the response type.
+</ParamField>
+
+<ParamField path="codec_path(impl AsRef<str>)" type="builder method" required>
+  Full Rust path to a type implementing `tonic::codec::Codec`. Must implement `Default`.
+</ParamField>
+
+<ParamField path="client_streaming()" type="builder method">
+  Marks the method as client-streaming.
+</ParamField>
+
+<ParamField path="server_streaming()" type="builder method">
+  Marks the method as server-streaming.
+</ParamField>
+
+### `manual::Builder`
+
+Controls what gets generated and where.
+
+<ParamField path="build_client(bool)" type="builder method">
+  Enable or disable client code generation. Default: `true`.
+</ParamField>
+
+<ParamField path="build_server(bool)" type="builder method">
+  Enable or disable server code generation. Default: `true`.
+</ParamField>
+
+<ParamField path="build_transport(bool)" type="builder method">
+  Include transport features in generated clients. Default: `true`.
+</ParamField>
+
+<ParamField path="out_dir(impl AsRef<Path>)" type="builder method">
+  Output directory. Defaults to the `OUT_DIR` environment variable.
+</ParamField>
+
+<ParamField path="compile(&[Service])" type="method">
+  Runs code generation for all provided services and writes the output files.
+</ParamField>
+
+<Note>
+  Both `name` and `package` on `ServiceBuilder`, and `name`, `route_name`, `input_type`, `output_type`, and `codec_path` on `MethodBuilder` are required. Calling `.build()` without them will panic.
+</Note>
+
+## Feature flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `transport` | enabled | Generates a `connect()` method on clients using `tonic::transport::Channel` |

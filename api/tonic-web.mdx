@@ -1,0 +1,179 @@
+---
+title: 'tonic-web: gRPC-Web protocol support for browsers'
+description: 'Enable browser clients to call your tonic gRPC server directly using the gRPC-Web protocol, without an external proxy, using GrpcWebLayer.'
+keywords: ['tonic-web', 'grpc-web', 'browser', 'grpc', 'rust', 'tonic', 'GrpcWebLayer', 'tower']
+---
+
+`tonic-web` enables tonic servers to accept requests from [gRPC-Web](https://github.com/grpc/grpc-web) clients—typically browser applications—without requiring an external proxy like Envoy. It works by wrapping tonic services with a Tower middleware layer that translates between the gRPC-Web wire format and the standard gRPC/HTTP2 protocol your server already speaks.
+
+## Installation
+
+```toml Cargo.toml
+[dependencies]
+tonic = "0.14"
+tonic-web = "0.14"
+```
+
+## How it works
+
+Standard gRPC relies on HTTP/2 features (trailers, streaming framing) that browsers cannot access directly. gRPC-Web is a variant of the protocol designed for HTTP/1.1 and browser `fetch`, encoding trailers in the response body and using base64 for text-mode encoding. `tonic-web` intercepts requests with gRPC-Web content types, translates them to standard gRPC, forwards them to your service, and translates the response back.
+
+The translation happens transparently. Normal gRPC clients communicating over HTTP/2 pass through unchanged.
+
+## `GrpcWebLayer`
+
+`GrpcWebLayer` is a Tower [`Layer`](https://docs.rs/tower-layer/latest/tower_layer/trait.Layer.html) that wraps a service and performs gRPC-Web protocol translation.
+
+```rust
+pub struct GrpcWebLayer { /* private */ }
+```
+
+### `GrpcWebLayer::new() -> GrpcWebLayer`
+
+Creates a new layer instance. Apply it to your `tonic::Server` builder using `.layer()`.
+
+```rust
+use tonic_web::GrpcWebLayer;
+
+Server::builder()
+    .accept_http1(true)
+    .layer(GrpcWebLayer::new())
+    .add_service(my_service)
+    .serve(addr)
+    .await?;
+```
+
+When used with `.layer()` on the server builder, the layer applies to all services added after it.
+
+## Required server configuration
+
+### `Server::builder().accept_http1(true)`
+
+gRPC-Web clients connect over HTTP/1.1. Tonic's server defaults to HTTP/2 only. You must call `.accept_http1(true)` on the server builder to accept HTTP/1.1 connections.
+
+```rust
+Server::builder()
+    .accept_http1(true)  // required for browser clients
+    .layer(GrpcWebLayer::new())
+    // ...
+```
+
+<Note>
+  If your server is TLS-enabled, you can omit `.accept_http1(true)`. Browsers negotiate the protocol via ALPN, and TLS handles the version negotiation transparently.
+</Note>
+
+## Supported request types
+
+gRPC-Web clients can send the following content types, all of which `tonic-web` handles:
+
+| Content-Type | Description |
+|---|---|
+| `application/grpc-web` | Binary gRPC-Web |
+| `application/grpc-web+proto` | Binary gRPC-Web with proto encoding |
+| `application/grpc-web-text` | Base64-encoded gRPC-Web |
+| `application/grpc-web-text+proto` | Base64-encoded gRPC-Web with proto encoding |
+
+All other requests, including standard `application/grpc` over HTTP/2, pass through the layer unchanged to the inner service.
+
+## Limitations
+
+<Warning>
+  gRPC-Web clients only support **unary** and **server-streaming** RPCs. Client-streaming and bidirectional-streaming calls are not supported by the gRPC-Web protocol itself. Sending such requests will result in an error.
+</Warning>
+
+- The CORS support in `tonic-web` handles only gRPC-Web and gRPC-Web preflight requests. For full CORS control, compose `GrpcWebLayer` with a dedicated CORS layer from `tower-http`.
+- WebSocket transports are not supported.
+- `tonic-web` is not designed to handle arbitrary HTTP/1.x requests or bespoke protocols.
+
+## CORS configuration
+
+For production use with browser clients that have an `Origin` header, compose `GrpcWebLayer` with `tower_http::cors::CorsLayer`:
+
+```rust
+use tower_http::cors::{CorsLayer, AllowOrigin};
+use tonic_web::GrpcWebLayer;
+
+Server::builder()
+    .accept_http1(true)
+    .layer(
+        tower::ServiceBuilder::new()
+            .layer(
+                CorsLayer::new()
+                    .allow_origin(AllowOrigin::any())
+                    .allow_headers(tower_http::cors::Any),
+            )
+            .layer(GrpcWebLayer::new()),
+    )
+    .add_service(my_service)
+    .serve(addr)
+    .await?;
+```
+
+## Full working example
+
+```rust src/main.rs
+use tonic::transport::Server;
+use tonic_web::GrpcWebLayer;
+
+pub mod helloworld {
+    tonic::include_proto!("helloworld");
+}
+
+use helloworld::greeter_server::{Greeter, GreeterServer};
+use helloworld::{HelloReply, HelloRequest};
+
+#[derive(Default)]
+struct MyGreeter;
+
+#[tonic::async_trait]
+impl Greeter for MyGreeter {
+    async fn say_hello(
+        &self,
+        request: tonic::Request<HelloRequest>,
+    ) -> Result<tonic::Response<HelloReply>, tonic::Status> {
+        Ok(tonic::Response::new(HelloReply {
+            message: format!("Hello, {}!", request.into_inner().name),
+        }))
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let addr = "[::1]:50051".parse()?;
+    let greeter = GreeterServer::new(MyGreeter::default());
+
+    Server::builder()
+        .accept_http1(true)
+        .layer(GrpcWebLayer::new())
+        .add_service(greeter)
+        .serve(addr)
+        .await?;
+
+    Ok(())
+}
+```
+
+With this setup, standard gRPC clients (using HTTP/2) and gRPC-Web browser clients both work against the same server on the same port.
+
+## TLS variant
+
+If you're using TLS, drop `.accept_http1(true)`:
+
+```rust
+use tonic::transport::{Identity, Server, ServerTlsConfig};
+
+let cert = tokio::fs::read("server.pem").await?;
+let key = tokio::fs::read("server.key").await?;
+let identity = Identity::from_pem(cert, key);
+
+Server::builder()
+    .tls_config(ServerTlsConfig::new().identity(identity))?
+    .layer(GrpcWebLayer::new())
+    .add_service(greeter)
+    .serve(addr)
+    .await?;
+```
+
+<Tip>
+  The `GrpcWebLayer` also works with Axum. Add it as a layer on your Axum router or on individual routes using `tower_layer::Layer`.
+</Tip>

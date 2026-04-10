@@ -1,0 +1,256 @@
+---
+title: 'tonic::codec — Encoding, Decoding, and Compression'
+description: 'The Codec, Encoder, and Decoder traits in tonic, default protobuf (prost) behavior, custom codec implementations, and CompressionEncoding configuration.'
+---
+
+The `tonic::codec` module defines how gRPC messages are serialized and deserialized. The default implementation uses [`prost`](https://github.com/tokio-rs/prost) to encode and decode Protocol Buffers, but the `Codec` trait is generic — you can plug in any serialization format. This page covers the core traits, the default codec behavior, the `Streaming<T>` decoded stream type, and how to implement a custom codec such as the JSON codec from the tonic examples.
+
+## The `Codec` trait
+
+```rust
+pub trait Codec {
+    /// The encodable message type (outbound).
+    type Encode: Send + 'static;
+    /// The decodable message type (inbound).
+    type Decode: Send + 'static;
+
+    /// The encoder that serializes `Encode` into bytes.
+    type Encoder: Encoder<Item = Self::Encode, Error = Status> + Send + 'static;
+    /// The decoder that deserializes bytes into `Decode`.
+    type Decoder: Decoder<Item = Self::Decode, Error = Status> + Send + 'static;
+
+    /// Returns a new encoder instance.
+    fn encoder(&mut self) -> Self::Encoder;
+    /// Returns a new decoder instance.
+    fn decoder(&mut self) -> Self::Decoder;
+}
+```
+
+A `Codec` is a factory for encoder/decoder pairs. It is called once per RPC to obtain the codec for that call. The `Encode` and `Decode` associated types can differ, which is useful for bidirectional streaming where request and response types may be distinct.
+
+### `Encoder` trait
+
+```rust
+pub trait Encoder {
+    type Item;
+    type Error: From<io::Error>;
+
+    fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error>;
+
+    /// Optional: override buffer allocation behavior. Defaults to 8 KiB.
+    fn buffer_settings(&self) -> BufferSettings {
+        BufferSettings::default()
+    }
+}
+```
+
+The `dst` buffer is pre-allocated by tonic. Write the encoded bytes of `item` into it. The gRPC framing (5-byte header: 1 compression flag + 4 length) is added by tonic automatically — do not include it in your encoder output.
+
+### `Decoder` trait
+
+```rust
+pub trait Decoder {
+    type Item;
+    type Error: From<io::Error>;
+
+    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error>;
+
+    /// Optional: override buffer allocation behavior.
+    fn buffer_settings(&self) -> BufferSettings {
+        BufferSettings::default()
+    }
+}
+```
+
+`src` contains exactly the bytes of one complete gRPC message frame (framing already stripped). Return `Ok(Some(item))` when the message is successfully decoded, `Ok(None)` if the buffer is empty, or `Err(status)` on a decoding error.
+
+---
+
+## Default codec (prost / protobuf)
+
+When you use `tonic-build` to generate code from `.proto` files, the generated stubs use `tonic::codec::ProstCodec<T, U>` automatically. You do not need to configure anything.
+
+`ProstCodec` encodes messages using `prost::Message::encode` and decodes them using `prost::Message::decode`. It handles all protobuf wire format details transparently.
+
+<Note>
+The default buffer sizes are 8 KiB per RPC for encoding and 4 MiB maximum for decoding a single received message. Override these by implementing `Encoder::buffer_settings` or `Decoder::buffer_settings` in a custom codec.
+</Note>
+
+### `BufferSettings`
+
+```rust
+#[derive(Clone, Copy, Debug)]
+pub struct BufferSettings {
+    buffer_size: usize,      // initial and growth increment (default: 8 KiB)
+    yield_threshold: usize,  // batch size for streaming sends (default: 32 KiB)
+}
+
+impl BufferSettings {
+    pub fn new(buffer_size: usize, yield_threshold: usize) -> Self;
+}
+```
+
+Tonic eagerly allocates `buffer_size` bytes per RPC and grows the buffer in `buffer_size` increments. The `yield_threshold` controls how much data is batched before yielding to the executor in server-streaming RPCs — larger values reduce syscall overhead at the cost of memory.
+
+---
+
+## `Streaming<T>`
+
+`Streaming<T>` is the decoded stream used for client-streaming, server-streaming, and bidirectional-streaming RPCs. It wraps an HTTP body and a `Decoder`, exposing a simple async interface.
+
+```rust
+pub struct Streaming<T> { /* ... */ }
+
+impl<T> Streaming<T> {
+    pub async fn message(&mut self) -> Result<Option<T>, Status>;
+    pub async fn trailers(&mut self) -> Result<Option<MetadataMap>, Status>;
+}
+```
+
+It also implements `tokio_stream::Stream<Item = Result<T, Status>>`, enabling use with `StreamExt` combinators.
+
+For full documentation of `message()` and `trailers()`, see the [client reference](/api/client#tonicstreamingt).
+
+---
+
+## Custom codec implementation
+
+Tonic supports any serialization format. The following example, taken from the `examples/src/json-codec` directory of the tonic repository, shows a complete `application/grpc+json` codec using `serde_json`.
+
+<CodeGroup>
+
+```rust common.rs
+use bytes::{Buf, BufMut};
+use serde::{Deserialize, Serialize};
+use std::marker::PhantomData;
+use tonic::{
+    Status,
+    codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder},
+};
+
+pub struct JsonEncoder<T>(PhantomData<T>);
+
+impl<T: Serialize> Encoder for JsonEncoder<T> {
+    type Item = T;
+    type Error = Status;
+
+    fn encode(
+        &mut self,
+        item: Self::Item,
+        buf: &mut EncodeBuf<'_>,
+    ) -> Result<(), Self::Error> {
+        serde_json::to_writer(buf.writer(), &item)
+            .map_err(|e| Status::internal(e.to_string()))
+    }
+}
+
+pub struct JsonDecoder<U>(PhantomData<U>);
+
+impl<U: serde::de::DeserializeOwned> Decoder for JsonDecoder<U> {
+    type Item = U;
+    type Error = Status;
+
+    fn decode(
+        &mut self,
+        buf: &mut DecodeBuf<'_>,
+    ) -> Result<Option<Self::Item>, Self::Error> {
+        if !buf.has_remaining() {
+            return Ok(None);
+        }
+        let item = serde_json::from_reader(buf.reader())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Some(item))
+    }
+}
+
+/// A Codec that implements `application/grpc+json` via serde.
+#[derive(Debug, Clone, Default)]
+pub struct JsonCodec<T, U>(PhantomData<(T, U)>);
+
+impl<T, U> Codec for JsonCodec<T, U>
+where
+    T: Serialize + Send + 'static,
+    U: serde::de::DeserializeOwned + Send + 'static,
+{
+    type Encode = T;
+    type Decode = U;
+    type Encoder = JsonEncoder<T>;
+    type Decoder = JsonDecoder<U>;
+
+    fn encoder(&mut self) -> Self::Encoder { JsonEncoder(PhantomData) }
+    fn decoder(&mut self) -> Self::Decoder { JsonDecoder(PhantomData) }
+}
+```
+
+</CodeGroup>
+
+<Tip>
+To use a custom codec with a generated client or server, pass it as a type parameter to `tonic::client::Grpc::new` or supply it via the `codec` attribute in your `build.rs` `tonic-build` configuration.
+</Tip>
+
+---
+
+## `CompressionEncoding`
+
+tonic supports per-message compression for gRPC bodies. Compression is negotiated via the `grpc-encoding` and `grpc-accept-encoding` HTTP/2 headers.
+
+```rust
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompressionEncoding {
+    #[cfg(feature = "gzip")]
+    Gzip,
+    #[cfg(feature = "deflate")]
+    Deflate,
+    #[cfg(feature = "zstd")]
+    Zstd,
+}
+```
+
+Each variant is gated behind the corresponding Cargo feature (`gzip`, `deflate`, `zstd`). The `#[non_exhaustive]` attribute means new variants may be added in future releases without a breaking change.
+
+### Enabling compression on a server
+
+Generated server stubs expose `send_compressed` and `accept_compressed` methods:
+
+```rust
+let svc = GreeterServer::new(MyGreeter)
+    .send_compressed(CompressionEncoding::Gzip)
+    .accept_compressed(CompressionEncoding::Gzip);
+```
+
+### Enabling compression on a client
+
+```rust
+let client = GreeterClient::new(channel)
+    .send_compressed(CompressionEncoding::Gzip)
+    .accept_compressed(CompressionEncoding::Gzip);
+```
+
+### Disabling compression for a single response
+
+You can opt a single unary response out of compression even when the server has compression enabled:
+
+```rust
+let mut response = Response::new(HelloReply { message: "Hello".into() });
+response.disable_compression(); // requires gzip/deflate/zstd feature
+Ok(response)
+```
+
+<Warning>
+`Response::disable_compression` only affects unary responses and client-to-server streaming. Server-to-client stream frames continue to use the server's configured encoding.
+</Warning>
+
+### `EnabledCompressionEncodings`
+
+```rust
+pub struct EnabledCompressionEncodings { /* ... */ }
+
+impl EnabledCompressionEncodings {
+    pub fn enable(&mut self, encoding: CompressionEncoding);
+    pub fn is_enabled(&self, encoding: CompressionEncoding) -> bool;
+    pub fn is_empty(&self) -> bool;
+}
+```
+
+This struct tracks which compression algorithms are active on a server or channel. It holds an ordered list of up to three encodings and is used internally when generating the `grpc-accept-encoding` header.

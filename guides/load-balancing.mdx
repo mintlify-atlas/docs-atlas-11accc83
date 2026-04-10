@@ -1,0 +1,248 @@
+---
+title: "Load balancing with Channel"
+description: "Distribute gRPC requests across multiple backend endpoints using Tonic's built-in Channel load balancer with static or dynamically updated endpoint lists."
+keywords: ["tonic", "load balancing", "channel", "endpoint", "balance_list", "balance_channel", "grpc"]
+---
+
+Tonic's `Channel` type has first-class support for load balancing across multiple backend instances. Under the hood it uses Tower's [power-of-two-choices](https://www.nginx.com/blog/nginx-power-of-two-choices-load-balancing-algorithm/) (`p2c`) balancer to distribute requests. There are two approaches depending on whether your set of backends is known up front or needs to change while the client is running.
+
+## Static load balancing
+
+Use `Channel::balance_list` when you have a fixed list of backend addresses at startup. Pass an iterator of `Endpoint` values; the channel connects to all of them and balances traffic across the live connections.
+
+```rust
+use tonic::transport::Channel;
+
+let endpoints = ["http://[::1]:50051", "http://[::1]:50052"]
+    .iter()
+    .map(|a| Channel::from_static(a));
+
+let channel = Channel::balance_list(endpoints);
+```
+
+Pass the resulting `Channel` directly to a generated client:
+
+```rust
+let mut client = EchoClient::new(channel);
+```
+
+Every call on `client` is balanced automatically. The `Channel` type is cheap to clone, so you can share it across tasks without any additional synchronization.
+
+### Complete static example
+
+This is the full example from `examples/src/load_balance/`:
+
+<CodeGroup>
+
+```rust client.rs
+pub mod pb {
+    tonic::include_proto!("grpc.examples.unaryecho");
+}
+
+use pb::{EchoRequest, echo_client::EchoClient};
+use tonic::transport::Channel;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let endpoints = ["http://[::1]:50051", "http://[::1]:50052"]
+        .iter()
+        .map(|a| Channel::from_static(a));
+
+    let channel = Channel::balance_list(endpoints);
+
+    let mut client = EchoClient::new(channel);
+
+    for _ in 0..12usize {
+        let request = tonic::Request::new(EchoRequest {
+            message: "hello".into(),
+        });
+
+        let response = client.unary_echo(request).await?;
+
+        println!("RESPONSE={response:?}");
+    }
+
+    Ok(())
+}
+```
+
+```rust server.rs
+pub mod pb {
+    tonic::include_proto!("grpc.examples.unaryecho");
+}
+
+use std::net::SocketAddr;
+use tokio::sync::mpsc;
+use tonic::{Request, Response, Status, transport::Server};
+use pb::{EchoRequest, EchoResponse};
+
+type EchoResult<T> = Result<Response<T>, Status>;
+
+#[derive(Debug)]
+pub struct EchoServer {
+    addr: SocketAddr,
+}
+
+#[tonic::async_trait]
+impl pb::echo_server::Echo for EchoServer {
+    async fn unary_echo(&self, request: Request<EchoRequest>) -> EchoResult<EchoResponse> {
+        let message = format!("{} (from {})", request.into_inner().message, self.addr);
+        Ok(Response::new(EchoResponse { message }))
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let addrs = ["[::1]:50051", "[::1]:50052"];
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    for addr in &addrs {
+        let addr = addr.parse()?;
+        let tx = tx.clone();
+
+        let server = EchoServer { addr };
+        let serve = Server::builder()
+            .add_service(pb::echo_server::EchoServer::new(server))
+            .serve(addr);
+
+        tokio::spawn(async move {
+            if let Err(e) = serve.await {
+                eprintln!("Error = {e:?}");
+            }
+            tx.send(()).unwrap();
+        });
+    }
+
+    rx.recv().await;
+
+    Ok(())
+}
+```
+
+</CodeGroup>
+
+## Dynamic load balancing
+
+Use `Channel::balance_channel` when your set of backends needs to change at runtime — for example, when instances are added or removed by a service discovery system. It returns a `(Channel, Sender<Change<K, Endpoint>>)` pair. Send `Change::Insert` and `Change::Remove` messages on the sender to update the endpoint set while the client continues making requests.
+
+```rust
+use tonic::transport::{Channel, Endpoint};
+use tonic::transport::channel::Change;
+
+let (channel, tx) = Channel::balance_channel(10);
+let mut client = EchoClient::new(channel);
+```
+
+The `capacity` argument to `balance_channel` sets the buffer size of the channel used to receive endpoint changes.
+
+### Inserting and removing endpoints
+
+```rust
+// Add an endpoint
+let e1 = Endpoint::from_static("http://[::1]:50051");
+tx.send(Change::Insert("backend-1", e1)).await?;
+
+// Remove an endpoint
+tx.send(Change::Remove("backend-1")).await?;
+```
+
+The key type (here `&str`) is user-defined. It must implement `Hash + Eq + Send + Clone + 'static`. Use any string or integer type that uniquely identifies each backend in your system.
+
+### Complete dynamic example
+
+This is the full example from `examples/src/dynamic_load_balance/client.rs`. It starts with no endpoints and gradually adds, then removes backends to demonstrate live endpoint management:
+
+```rust
+pub mod pb {
+    tonic::include_proto!("grpc.examples.unaryecho");
+}
+
+use pb::{EchoRequest, echo_client::EchoClient};
+use tonic::transport::{Channel, Endpoint};
+use tonic::transport::channel::Change;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use tokio::time::timeout;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let e1 = Endpoint::from_static("http://[::1]:50051");
+    let e2 = Endpoint::from_static("http://[::1]:50052");
+
+    let (channel, tx) = Channel::balance_channel(10);
+    let mut client = EchoClient::new(channel);
+
+    let done = Arc::new(AtomicBool::new(false));
+    let demo_done = done.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        println!("Added first endpoint");
+        tx.send(Change::Insert("1", e1)).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        println!("Added second endpoint");
+        tx.send(Change::Insert("2", e2)).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        println!("Removed first endpoint");
+        tx.send(Change::Remove("1")).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        println!("Removed second endpoint");
+        tx.send(Change::Remove("2")).await.unwrap();
+
+        demo_done.swap(true, SeqCst);
+    });
+
+    while !done.load(SeqCst) {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        let request = tonic::Request::new(EchoRequest {
+            message: "hello".into(),
+        });
+
+        let rx = client.unary_echo(request);
+        if let Ok(resp) = timeout(tokio::time::Duration::from_secs(10), rx).await {
+            println!("RESPONSE={resp:?}");
+        } else {
+            println!("did not receive value within 10 secs");
+        }
+    }
+
+    println!("... Bye");
+    Ok(())
+}
+```
+
+<Warning>
+  When all endpoints have been removed, calls will block until a new endpoint is inserted or the timeout elapses. Always set a request timeout when using dynamic load balancing in production.
+</Warning>
+
+## Choosing between static and dynamic
+
+| | `Channel::balance_list` | `Channel::balance_channel` |
+|---|---|---|
+| Endpoint set | Fixed at startup | Mutable at runtime |
+| API | Iterator of `Endpoint` | `(Channel, Sender<Change<...>>)` |
+| Use case | Known backends, simple setup | Service discovery, autoscaling |
+
+## Creating endpoints
+
+Both `balance_list` and `balance_channel` work with `Endpoint` values. Use these constructors:
+
+```rust
+use tonic::transport::{Channel, Endpoint};
+
+// From a static string (zero allocation)
+let e = Channel::from_static("http://[::1]:50051");
+
+// From a dynamic string
+let e = Channel::from_shared("http://[::1]:50051".to_string())?;
+
+// Directly from a static str
+let e = Endpoint::from_static("http://[::1]:50051");
+```
+
+<Tip>
+  `Channel` implements `Clone` cheaply — it is backed by a buffered Tower service running in a background task. Clone it freely to share across multiple async tasks without additional `Arc` wrapping.
+</Tip>

@@ -1,0 +1,69 @@
+---
+title: "Introduction to Tonic, a Rust gRPC framework"
+description: "Tonic is a gRPC over HTTP/2 library for Rust focused on high performance, interoperability, and flexibility with first-class async/await support."
+keywords: ["tonic", "grpc", "rust", "http2", "async", "protobuf"]
+---
+
+Tonic is a Rust implementation of [gRPC](https://grpc.io), a high-performance, open-source RPC framework built on HTTP/2. It was created to provide first-class `async`/`await` support and to serve as a core building block for production systems written in Rust. Tonic is composed of three main components: the generic gRPC implementation, a high-performance HTTP/2 layer powered by [hyper](https://github.com/hyperium/hyper) and [tokio](https://github.com/tokio-rs/tokio), and code generation driven by [prost](https://github.com/tokio-rs/prost).
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Bi-directional streaming" icon="arrows-left-right">
+    All four gRPC service method types are supported: unary, server streaming, client streaming, and bi-directional streaming.
+  </Card>
+  <Card title="Async/await" icon="bolt">
+    Built from the ground up on Tokio. Every server handler and client call is a native async function.
+  </Card>
+  <Card title="TLS via rustls" icon="lock">
+    Transport-layer security is provided by [rustls](https://github.com/rustls/rustls) with a choice of `ring` or `aws-lc-rs` as the cryptography backend.
+  </Card>
+  <Card title="Code generation" icon="code">
+    Define services in `.proto` files. `tonic-prost-build` generates fully typed client and server stubs at build time.
+  </Card>
+  <Card title="Health checking" icon="heart-pulse">
+    `tonic-health` implements the standard [gRPC health checking protocol](https://grpc.io/docs/guides/health-checking/) as a drop-in service.
+  </Card>
+  <Card title="Server reflection" icon="magnifying-glass">
+    `tonic-reflection` exposes service schemas at runtime so tooling like grpcurl can discover and call your APIs without the `.proto` files.
+  </Card>
+  <Card title="gRPC-Web" icon="globe">
+    `tonic-web` translates between the gRPC-Web protocol and standard gRPC, enabling browser clients to reach your services.
+  </Card>
+  <Card title="Compression" icon="file-zipper">
+    Gzip, deflate, and zstd compression for requests, responses, and streams are all available as opt-in feature flags.
+  </Card>
+</CardGroup>
+
+## Project layout
+
+The repository is organized into several focused crates. You only need to pull in the ones relevant to your use case.
+
+| Crate | Description |
+|---|---|
+| `tonic` | Core gRPC and HTTP/2 client/server implementation. |
+| `tonic-prost` | [Prost](https://github.com/tokio-rs/prost) codec implementation for tonic. |
+| `tonic-prost-build` | Build-script integration that compiles `.proto` files into Rust code using prost. |
+| `tonic-health` | Implementation of the standard gRPC health checking service. |
+| `tonic-reflection` | gRPC server reflection support. |
+| `tonic-types` | Collection of useful protobuf types and gRPC Well Known Types. |
+| `tonic-web` | gRPC-Web protocol translation layer for tonic services. |
+
+## Minimum supported Rust version
+
+Tonic requires Rust **1.88** or later. You can update your toolchain with:
+
+```bash
+rustup update
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Add tonic to your project and configure feature flags.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build a working gRPC server and client in under ten minutes.
+  </Card>
+</CardGroup>

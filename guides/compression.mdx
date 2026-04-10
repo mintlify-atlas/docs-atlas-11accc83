@@ -1,0 +1,158 @@
+---
+title: "Compressing gRPC messages in Tonic"
+description: "Enable gzip, deflate, or zstd compression for gRPC messages. Configure send and accept encoding on servers and clients using CompressionEncoding."
+keywords: ["tonic", "compression", "gzip", "deflate", "zstd", "grpc", "encoding", "CompressionEncoding"]
+---
+
+Tonic can compress gRPC message bodies using the standard `grpc-encoding` and `grpc-accept-encoding` headers. Both the server and the client can declare which encodings they accept and which encoding they use when sending. Compression is opt-in and requires the relevant feature flag.
+
+## Feature flags
+
+Each compression algorithm is a separate optional feature. Enable the ones you need in `Cargo.toml`:
+
+<Tabs>
+  <Tab title="gzip">
+    ```toml Cargo.toml
+    [dependencies]
+    tonic = { version = "0.14", features = ["gzip"] }
+    ```
+
+    Uses `flate2` under the hood. The most widely supported encoding across gRPC implementations.
+  </Tab>
+  <Tab title="deflate">
+    ```toml Cargo.toml
+    [dependencies]
+    tonic = { version = "0.14", features = ["deflate"] }
+    ```
+
+    Also uses `flate2`, but with zlib framing rather than gzip framing. Less commonly used.
+  </Tab>
+  <Tab title="zstd">
+    ```toml Cargo.toml
+    [dependencies]
+    tonic = { version = "0.14", features = ["zstd"] }
+    ```
+
+    Uses `zstd`. Typically better compression ratios and faster decompression than gzip.
+  </Tab>
+  <Tab title="multiple">
+    ```toml Cargo.toml
+    [dependencies]
+    tonic = { version = "0.14", features = ["gzip", "deflate", "zstd"] }
+    ```
+
+    Enable all three to let peers negotiate the best available encoding.
+  </Tab>
+</Tabs>
+
+<Note>
+  Compression is not part of Tonic's default feature set. You must explicitly opt in via `features = [...]`.
+</Note>
+
+## The `CompressionEncoding` enum
+
+All compression configuration uses `tonic::codec::CompressionEncoding`. Its variants are conditionally compiled based on which features are enabled:
+
+```rust
+use tonic::codec::CompressionEncoding;
+
+// Available variants (each gated by its feature flag):
+// CompressionEncoding::Gzip    — requires feature "gzip"
+// CompressionEncoding::Deflate — requires feature "deflate"
+// CompressionEncoding::Zstd   — requires feature "zstd"
+```
+
+## Configuring the server
+
+Call `.send_compressed()` and `.accept_compressed()` on the generated server wrapper before passing it to `Server::builder()`.
+
+- **`send_compressed`** — the encoding Tonic uses when writing response messages.
+- **`accept_compressed`** — an encoding the server is willing to decode from incoming request messages.
+
+```rust server.rs
+use tonic::{Request, Response, Status, transport::Server};
+use tonic::codec::CompressionEncoding;
+use hello_world::greeter_server::{Greeter, GreeterServer};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let addr = "[::1]:50051".parse().unwrap();
+    let greeter = MyGreeter::default();
+
+    let service = GreeterServer::new(greeter)
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip);
+
+    Server::builder().add_service(service).serve(addr).await?;
+    Ok(())
+}
+```
+
+You can chain multiple calls to support more than one encoding:
+
+```rust
+let service = GreeterServer::new(greeter)
+    .send_compressed(CompressionEncoding::Gzip)
+    .accept_compressed(CompressionEncoding::Gzip)
+    .accept_compressed(CompressionEncoding::Zstd);
+```
+
+## Configuring the client
+
+The same two methods are available on generated client types.
+
+- **`send_compressed`** — the encoding the client uses when writing request messages.
+- **`accept_compressed`** — an encoding the client is willing to receive in responses.
+
+```rust client.rs
+use tonic::codec::CompressionEncoding;
+use tonic::transport::Channel;
+use hello_world::greeter_client::GreeterClient;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let channel = Channel::builder("http://[::1]:50051".parse().unwrap())
+        .connect()
+        .await
+        .unwrap();
+
+    let mut client = GreeterClient::new(channel)
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip);
+
+    let response = client.say_hello(tonic::Request::new(HelloRequest {
+        name: "Tonic".into(),
+    })).await?;
+
+    dbg!(response);
+    Ok(())
+}
+```
+
+## How negotiation works
+
+Tonic follows the standard gRPC compression negotiation:
+
+1. The client advertises accepted response encodings in the `grpc-accept-encoding` header.
+2. The server picks an encoding from that list that it also has enabled for `send_compressed`, and sets `grpc-encoding` on the response.
+3. If the server receives a request with a `grpc-encoding` it has not enabled via `accept_compressed`, it returns `Status::unimplemented` with the list of supported encodings in the response metadata.
+
+<Tip>
+  For best interoperability, always pair `send_compressed` with `accept_compressed` on both sides. A server that sends compressed responses but does not accept compressed requests will fail if a client sends a compressed request body.
+</Tip>
+
+## Unsupported encodings
+
+If a peer sends a message with an encoding your side does not support, Tonic returns an `UNIMPLEMENTED` status and includes a `grpc-accept-encoding` header listing the encodings it does support:
+
+```
+status: UNIMPLEMENTED
+message: Content is compressed with `zstd` which isn't supported
+grpc-accept-encoding: gzip,identity
+```
+
+This allows the sender to fall back to a mutually supported encoding.
+
+<Warning>
+  Compression adds CPU overhead. For latency-sensitive services with small messages, the compression cost may outweigh the bandwidth savings. Profile before enabling compression in production.
+</Warning>

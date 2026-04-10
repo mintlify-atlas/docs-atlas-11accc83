@@ -1,0 +1,180 @@
+---
+title: "Using interceptors in Tonic"
+description: "Intercept every request on the client or server with a function or the Interceptor trait. Useful for logging, auth, tracing, and metadata injection."
+keywords: ["tonic", "interceptor", "middleware", "grpc", "logging", "auth", "request", "intercept"]
+---
+
+Interceptors are functions that run before a request reaches the handler (server-side) or before it is sent to the server (client-side). They receive a `Request<()>` — a request with the message body erased but with metadata and extensions intact — and return either the same request (possibly modified) or a `Status` error to abort the call.
+
+## The intercept function signature
+
+Every interceptor has the same signature:
+
+```rust
+fn intercept(req: Request<()>) -> Result<Request<()>, Status>
+```
+
+You can return `Err(Status)` at any point to cancel the request and send that status back to the caller. Returning `Ok(req)` allows the request to proceed.
+
+## Client interceptors
+
+Wrap a channel with `with_interceptor` on the generated client type. The interceptor closure runs before every outbound call.
+
+```rust client.rs
+use tonic::{Request, Status, transport::Endpoint};
+use hello_world::greeter_client::GreeterClient;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let channel = Endpoint::from_static("http://[::1]:50051")
+        .connect()
+        .await?;
+
+    let mut client = GreeterClient::with_interceptor(channel, intercept);
+
+    let response = client.say_hello(tonic::Request::new(HelloRequest {
+        name: "Tonic".into(),
+    })).await?;
+
+    println!("RESPONSE={response:?}");
+    Ok(())
+}
+
+/// Called on every outbound request. Return Err(Status) to cancel the call.
+fn intercept(req: Request<()>) -> Result<Request<()>, Status> {
+    println!("Intercepting request: {req:?}");
+    Ok(req)
+}
+```
+
+## Server interceptors
+
+Wrap the generated server type with `with_interceptor`. The interceptor runs before each handler invocation.
+
+```rust server.rs
+use tonic::{Request, Response, Status, transport::Server};
+use hello_world::greeter_server::{Greeter, GreeterServer};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let addr = "[::1]:50051".parse().unwrap();
+    let greeter = MyGreeter::default();
+
+    let svc = GreeterServer::with_interceptor(greeter, intercept);
+
+    Server::builder().add_service(svc).serve(addr).await?;
+    Ok(())
+}
+
+/// This function is called on each inbound request. A returned Status cancels
+/// the request and sends that status to the client.
+fn intercept(mut req: Request<()>) -> Result<Request<()>, Status> {
+    println!("Intercepting request: {req:?}");
+
+    // Extensions allow passing arbitrary data to handlers
+    req.extensions_mut().insert(MyExtension {
+        some_piece_of_data: "foo".to_string(),
+    });
+
+    Ok(req)
+}
+
+#[derive(Clone)]
+struct MyExtension {
+    some_piece_of_data: String,
+}
+```
+
+### Reading extensions in a handler
+
+Data inserted via `extensions_mut()` in the interceptor is available in the handler through `request.extensions()`:
+
+```rust
+async fn say_hello(
+    &self,
+    request: Request<HelloRequest>,
+) -> Result<Response<HelloReply>, Status> {
+    let extension = request.extensions().get::<MyExtension>().unwrap();
+    println!("extension data = {}", extension.some_piece_of_data);
+
+    Ok(Response::new(HelloReply {
+        message: format!("Hello {}!", request.into_inner().name),
+    }))
+}
+```
+
+## Named interceptors with the `Interceptor` trait
+
+Closures cannot be named as types, which makes them awkward to store in structs or return from functions. Implement the `Interceptor` trait instead to get a nameable type.
+
+```rust
+use tonic::{Request, Status, service::Interceptor, codegen::InterceptedService, transport::Channel};
+use hello_world::greeter_client::GreeterClient;
+
+struct MyInterceptor;
+
+impl Interceptor for MyInterceptor {
+    fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
+        // add auth header, log, trace, etc.
+        Ok(request)
+    }
+}
+
+async fn using_named_interceptor() -> Result<(), Box<dyn std::error::Error>> {
+    let channel = Endpoint::from_static("http://[::1]:50051")
+        .connect()
+        .await?;
+
+    // The full type is nameable because MyInterceptor implements Interceptor
+    let client: GreeterClient<InterceptedService<Channel, MyInterceptor>> =
+        GreeterClient::with_interceptor(channel, MyInterceptor);
+
+    Ok(())
+}
+```
+
+## Using a function pointer
+
+If your interceptor is a bare function that captures no variables, you can use a function pointer type:
+
+```rust
+use tonic::{Request, Status, codegen::InterceptedService, transport::Channel};
+use hello_world::greeter_client::GreeterClient;
+
+fn intercept(req: Request<()>) -> Result<Request<()>, Status> {
+    Ok(req)
+}
+
+async fn using_function_pointer() -> Result<(), Box<dyn std::error::Error>> {
+    let channel = Endpoint::from_static("http://[::1]:50051")
+        .connect()
+        .await?;
+
+    let client: GreeterClient<
+        InterceptedService<Channel, fn(tonic::Request<()>) -> Result<tonic::Request<()>, Status>>,
+    > = GreeterClient::with_interceptor(channel, intercept);
+
+    Ok(())
+}
+```
+
+## Common uses
+
+<CardGroup cols={2}>
+  <Card title="Authentication" icon="shield">
+    Insert an `authorization` header on every outbound call, or reject unauthenticated inbound calls before they reach a handler. See the [authentication guide](/guides/authentication).
+  </Card>
+  <Card title="Logging" icon="file-text">
+    Print or record the request path, metadata, and timing on each call without modifying individual handlers.
+  </Card>
+  <Card title="Tracing" icon="activity">
+    Extract a trace ID from incoming metadata and insert it into request extensions so handlers can attach spans to the correct distributed trace.
+  </Card>
+  <Card title="Data injection via extensions" icon="database">
+    Parse, validate, or look up data in the interceptor (e.g., a user record from a token) and attach it as a typed extension so handlers can access it without re-parsing.
+  </Card>
+</CardGroup>
+
+<Warning>
+  Interceptors receive `Request<()>` — the body is not available. Interceptors are intended for metadata-level concerns only. To access or transform message bodies, use a Tower middleware layer instead.
+</Warning>

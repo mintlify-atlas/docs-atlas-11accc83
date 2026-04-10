@@ -1,0 +1,128 @@
+---
+title: "Authenticating gRPC requests in Tonic"
+description: "Attach bearer tokens to outgoing requests and validate them on the server using metadata and interceptors. Covers client and server patterns."
+keywords: ["tonic", "authentication", "bearer token", "authorization", "metadata", "interceptor", "grpc"]
+---
+
+gRPC authentication in Tonic flows through request metadata — the HTTP/2 equivalent of HTTP headers. The client inserts a token into the `authorization` metadata key before each call, and the server reads and validates it. Both sides use the interceptor mechanism to keep this logic separate from business code.
+
+## Attaching a token on the client
+
+The simplest approach wraps an existing channel with `with_interceptor`. The closure receives a mutable `Request<()>` before each call and can insert any metadata.
+
+```rust client.rs
+use tonic::{Request, metadata::MetadataValue, transport::Channel};
+use pb::echo_client::EchoClient;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let channel = Channel::from_static("http://[::1]:50051").connect().await?;
+
+    let token: MetadataValue<_> = "Bearer some-auth-token".parse()?;
+
+    let mut client = EchoClient::with_interceptor(channel, move |mut req: Request<()>| {
+        req.metadata_mut().insert("authorization", token.clone());
+        Ok(req)
+    });
+
+    let response = client.unary_echo(tonic::Request::new(EchoRequest {
+        message: "hello".into(),
+    })).await?;
+
+    println!("RESPONSE={response:?}");
+    Ok(())
+}
+```
+
+<Note>
+  `MetadataValue<_>` is a wrapper around an HTTP header value. Parsing from a string returns `Err` if the value contains characters invalid in HTTP/2 headers — use `?` or handle the error explicitly.
+</Note>
+
+### Attaching a token to a single request
+
+If you only need a token on one call rather than every call, insert it directly into the individual request instead of via an interceptor:
+
+```rust
+let mut request = tonic::Request::new(EchoRequest {
+    message: "hello".into(),
+});
+
+request.metadata_mut().insert(
+    "authorization",
+    "Bearer some-auth-token".parse().unwrap(),
+);
+
+let response = client.unary_echo(request).await?;
+```
+
+## Validating a token on the server
+
+The server uses `with_interceptor` on the generated server type. The interceptor function runs before the handler and returns `Err(Status)` to reject the request or `Ok(req)` to allow it through.
+
+```rust server.rs
+use tonic::{Request, Response, Status, metadata::MetadataValue, transport::Server};
+use pb::echo_server::EchoServer;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let addr = "[::1]:50051".parse().unwrap();
+    let server = EchoServer::default();
+
+    let svc = pb::echo_server::EchoServer::with_interceptor(server, check_auth);
+
+    Server::builder().add_service(svc).serve(addr).await?;
+    Ok(())
+}
+
+fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
+    let token: MetadataValue<_> = "Bearer some-secret-token".parse().unwrap();
+
+    match req.metadata().get("authorization") {
+        Some(t) if token == t => Ok(req),
+        _ => Err(Status::unauthenticated("No valid auth token")),
+    }
+}
+```
+
+<Warning>
+  This example compares the token with a hardcoded string. In production, use a cryptographically secure comparison (e.g., `subtle::ConstantTimeEq`) and load the expected token from configuration or a secrets manager — never embed it in source code.
+</Warning>
+
+## Reading metadata in a handler
+
+Interceptors are the right place for authentication logic, but if you need to read metadata inside a handler — for example to extract a user ID from a validated JWT — use `request.metadata()`:
+
+```rust
+async fn unary_echo(
+    &self,
+    request: Request<EchoRequest>,
+) -> Result<Response<EchoResponse>, Status> {
+    if let Some(user_id) = request.metadata().get("x-user-id") {
+        println!("request from user: {:?}", user_id);
+    }
+
+    let message = request.into_inner().message;
+    Ok(Response::new(EchoResponse { message }))
+}
+```
+
+## How the pieces fit together
+
+<CardGroup cols={2}>
+  <Card title="Client interceptor" icon="arrow-right">
+    Runs on every outbound request. Insert the `authorization` header once here rather than at every call site.
+  </Card>
+  <Card title="Server interceptor" icon="shield">
+    Runs before every inbound handler. Return `Status::unauthenticated` to reject the request before it reaches business logic.
+  </Card>
+  <Card title="Per-request metadata" icon="tag">
+    Use `request.metadata_mut()` for one-off overrides on individual requests when global token insertion is not appropriate.
+  </Card>
+  <Card title="Handler metadata access" icon="search">
+    Use `request.metadata()` inside a handler to read user identity or other request-scoped values after authentication has passed.
+  </Card>
+</CardGroup>
+
+<Tip>
+  For more details on writing interceptors — including named interceptors and the `Interceptor` trait — see the [interceptors guide](/guides/interceptors).
+</Tip>

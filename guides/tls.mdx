@@ -1,0 +1,213 @@
+---
+title: "Securing connections with TLS in Tonic"
+description: "Configure TLS on Tonic servers and clients using rustls. Covers feature flags, server and client certificates, and mutual TLS authentication."
+keywords: ["tonic", "tls", "rustls", "grpc", "mtls", "certificates", "identity", "transport security"]
+---
+
+Tonic uses [rustls](https://github.com/rustls/rustls) for TLS. All TLS types live in `tonic::transport` and require one of the TLS feature flags to be enabled. By default, Tonic compiles without TLS — you opt in via `Cargo.toml`.
+
+## Feature flags
+
+Tonic exposes two mutually exclusive TLS backends, plus two optional root certificate bundles.
+
+<Warning>
+  `tls-ring` and `tls-aws-lc` are mutually exclusive. Enabling both will cause a compile error. Pick one based on your deployment environment.
+</Warning>
+
+<CardGroup cols={2}>
+  <Card title="tls-ring" icon="lock">
+    Uses the [ring](https://github.com/briansmith/ring) cryptography library. Good default choice for most Linux and macOS targets.
+  </Card>
+  <Card title="tls-aws-lc" icon="lock">
+    Uses [AWS libcrypto (aws-lc-rs)](https://github.com/aws/aws-lc-rs). Required on some platforms such as AWS Graviton.
+  </Card>
+  <Card title="tls-native-roots" icon="certificate">
+    Loads root certificates from the OS trust store via `rustls-native-certs`. Requires either `tls-ring` or `tls-aws-lc`.
+  </Card>
+  <Card title="tls-webpki-roots" icon="certificate">
+    Bundles the [Mozilla WebPKI](https://github.com/rustls/webpki-roots) root store. Useful in containers where the OS trust store is absent.
+  </Card>
+</CardGroup>
+
+Add one backend and optionally one root bundle to your `Cargo.toml`:
+
+```toml Cargo.toml
+[dependencies]
+tonic = { version = "0.14", features = ["tls-ring", "tls-webpki-roots"] }
+```
+
+## Server TLS
+
+Use `ServerTlsConfig` to attach a certificate and private key to the server. Load the PEM-encoded files from disk, construct an `Identity`, and pass it to `.tls_config()` on the `Server` builder.
+
+```rust server.rs
+use tonic::transport::{Identity, Server, ServerTlsConfig};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cert = std::fs::read_to_string("data/tls/server.pem")?;
+    let key  = std::fs::read_to_string("data/tls/server.key")?;
+
+    let identity = Identity::from_pem(cert, key);
+
+    let addr = "[::1]:50051".parse().unwrap();
+
+    Server::builder()
+        .tls_config(ServerTlsConfig::new().identity(identity))?
+        .add_service(my_service)
+        .serve(addr)
+        .await?;
+
+    Ok(())
+}
+```
+
+<Note>
+  `.tls_config()` returns `Result` — the `?` propagates any certificate parsing errors early, before the server starts listening.
+</Note>
+
+## Client TLS
+
+The client needs the CA certificate that signed the server's certificate. Pass it as a `Certificate` to `ClientTlsConfig`, then call `.tls_config()` on the `Channel` builder.
+
+```rust client.rs
+use tonic::transport::{Certificate, Channel, ClientTlsConfig};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let pem = std::fs::read_to_string("data/tls/ca.pem")?;
+    let ca  = Certificate::from_pem(pem);
+
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(ca)
+        .domain_name("example.com");
+
+    let channel = Channel::from_static("https://[::1]:50051")
+        .tls_config(tls)?
+        .connect()
+        .await?;
+
+    // wrap with your generated client type
+    let mut client = EchoClient::new(channel);
+    Ok(())
+}
+```
+
+<Tip>
+  `.domain_name()` sets the SNI hostname sent during the TLS handshake. It must match the `CN` or a `subjectAltName` entry in the server certificate.
+</Tip>
+
+## Mutual TLS (client certificates)
+
+Mutual TLS requires the client to present its own certificate during the handshake. Both sides verify each other.
+
+<Steps>
+  <Step title="Configure the server to require client certificates">
+    Add `.client_ca_root()` to `ServerTlsConfig`. The server will verify the client's certificate against this CA.
+
+    ```rust server.rs
+    use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+
+    #[tokio::main]
+    async fn main() -> Result<(), Box<dyn std::error::Error>> {
+        let cert            = std::fs::read_to_string("data/tls/server.pem")?;
+        let key             = std::fs::read_to_string("data/tls/server.key")?;
+        let server_identity = Identity::from_pem(cert, key);
+
+        let client_ca_cert  = std::fs::read_to_string("data/tls/client_ca.pem")?;
+        let client_ca_cert  = Certificate::from_pem(client_ca_cert);
+
+        let tls = ServerTlsConfig::new()
+            .identity(server_identity)
+            .client_ca_root(client_ca_cert);
+
+        Server::builder()
+            .tls_config(tls)?
+            .add_service(my_service)
+            .serve("[::1]:50051".parse().unwrap())
+            .await?;
+
+        Ok(())
+    }
+    ```
+  </Step>
+
+  <Step title="Supply a client identity">
+    The client loads its own certificate and key alongside the server's CA cert, then adds `.identity()` to `ClientTlsConfig`.
+
+    ```rust client.rs
+    use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
+
+    #[tokio::main]
+    async fn main() -> Result<(), Box<dyn std::error::Error>> {
+        let server_root_ca = Certificate::from_pem(
+            std::fs::read_to_string("data/tls/ca.pem")?
+        );
+        let client_cert    = std::fs::read_to_string("data/tls/client1.pem")?;
+        let client_key     = std::fs::read_to_string("data/tls/client1.key")?;
+        let client_identity = Identity::from_pem(client_cert, client_key);
+
+        let tls = ClientTlsConfig::new()
+            .domain_name("localhost")
+            .ca_certificate(server_root_ca)
+            .identity(client_identity);
+
+        let channel = Channel::from_static("https://[::1]:50051")
+            .tls_config(tls)?
+            .connect()
+            .await?;
+
+        Ok(())
+    }
+    ```
+  </Step>
+
+  <Step title="Read peer certificates on the server (optional)">
+    Once mTLS is configured, you can inspect the client's presented certificates inside a service handler using `request.peer_certs()`.
+
+    ```rust
+    async fn unary_echo(
+        &self,
+        request: Request<EchoRequest>,
+    ) -> Result<Response<EchoResponse>, Status> {
+        let certs = request
+            .peer_certs()
+            .expect("Client did not send its certs!");
+
+        println!("Got {} peer certs!", certs.len());
+
+        let message = request.into_inner().message;
+        Ok(Response::new(EchoResponse { message }))
+    }
+    ```
+  </Step>
+</Steps>
+
+## Accessing TLS connection info
+
+Inside a handler, you can retrieve both the TCP and TLS connection metadata from request extensions.
+
+```rust
+use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
+
+async fn unary_echo(
+    &self,
+    request: Request<EchoRequest>,
+) -> Result<Response<EchoResponse>, Status> {
+    let conn_info = request
+        .extensions()
+        .get::<TlsConnectInfo<TcpConnectInfo>>()
+        .unwrap();
+
+    println!(
+        "Got a request from {:?} with info {:?}",
+        request.remote_addr(),
+        conn_info
+    );
+    // ...
+}
+```
+
+<Note>
+  `TlsConnectInfo` is only available when the `tls-connect-info` feature is enabled, which is pulled in automatically by `tls-ring` and `tls-aws-lc`.
+</Note>

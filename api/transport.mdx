@@ -1,0 +1,326 @@
+---
+title: 'tonic::transport — Server, Channel, Endpoint, and TLS'
+description: 'Batteries-included HTTP/2 server and client transport for tonic. Covers Server builder, Channel, Endpoint, and TLS configuration via rustls.'
+---
+
+The `tonic::transport` module provides a fully featured HTTP/2 server and client built on top of `hyper` and `tower`. It handles connection management, TLS, timeouts, rate limiting, and concurrency limits out of the box. TLS support requires the `rustls` feature flag.
+
+## Server
+
+`Server` is the entry point for building a gRPC server. Call `Server::builder()` to obtain a default instance, chain configuration methods, then call `add_service` and `serve`.
+
+```rust server.rs
+use std::time::Duration;
+use tonic::transport::{Server, Identity, ServerTlsConfig};
+
+Server::builder()
+    .tls_config(
+        ServerTlsConfig::new()
+            .identity(Identity::from_pem(&cert, &key)),
+    )?
+    .concurrency_limit_per_connection(256)
+    .timeout(Duration::from_secs(30))
+    .add_service(my_svc)
+    .serve("[::1]:50051".parse()?)
+    .await?;
+```
+
+### `Server::builder()`
+
+```rust
+pub fn builder() -> Self
+```
+
+Creates a new `Server` with default settings. Equivalent to `Server::default()`.
+
+### Configuration methods
+
+<AccordionGroup>
+  <Accordion title="concurrency_limit_per_connection">
+    ```rust
+    pub fn concurrency_limit_per_connection(self, limit: usize) -> Self
+    ```
+
+    Sets the maximum number of in-flight requests on a single connection. Additional requests are buffered (or rejected if `load_shed` is enabled).
+  </Accordion>
+
+  <Accordion title="load_shed">
+    ```rust
+    pub fn load_shed(self, load_shed: bool) -> Self
+    ```
+
+    When `true`, requests arriving when the service is not ready are immediately rejected with `Status::resource_exhausted`. Default is `false` (requests are buffered).
+  </Accordion>
+
+  <Accordion title="timeout">
+    ```rust
+    pub fn timeout(self, timeout: Duration) -> Self
+    ```
+
+    Applies a server-side deadline to every request handler. Requests that exceed the duration are cancelled with `Status::deadline_exceeded`.
+  </Accordion>
+
+  <Accordion title="tls_config">
+    ```rust
+    #[cfg(feature = "_tls-any")]
+    pub fn tls_config(self, tls_config: ServerTlsConfig) -> Result<Self, Error>
+    ```
+
+    Configures TLS for the server. Requires a valid `ServerTlsConfig` with an `Identity`. Returns an error if the TLS configuration is invalid.
+  </Accordion>
+
+  <Accordion title="max_concurrent_streams">
+    ```rust
+    pub fn max_concurrent_streams(self, max: impl Into<Option<u32>>) -> Self
+    ```
+
+    Sets the HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS` value. Defaults to no limit.
+  </Accordion>
+
+  <Accordion title="http2_keepalive_interval / http2_keepalive_timeout">
+    ```rust
+    pub fn http2_keepalive_interval(self, interval: Option<Duration>) -> Self
+    pub fn http2_keepalive_timeout(self, timeout: Option<Duration>) -> Self
+    ```
+
+    Controls HTTP/2 PING keepalive frames. The timeout (default 20 s) is how long to wait for a PING acknowledgement before closing the connection.
+  </Accordion>
+
+  <Accordion title="max_connection_age">
+    ```rust
+    pub fn max_connection_age(self, max_connection_age: Duration) -> Self
+    pub fn max_connection_age_grace(self, grace: Duration) -> Self
+    ```
+
+    Sets the maximum lifetime of a connection. After `max_connection_age` elapses the server starts a graceful shutdown. If `max_connection_age_grace` is also set and that period also elapses, the connection is forcefully closed.
+  </Accordion>
+
+  <Accordion title="accept_http1">
+    ```rust
+    pub fn accept_http1(self, accept_http1: bool) -> Self
+    ```
+
+    Allows the server to accept HTTP/1 requests in addition to HTTP/2. Useful for `grpc-web` support. Default is `false`.
+  </Accordion>
+
+  <Accordion title="layer">
+    ```rust
+    pub fn layer<NewLayer>(self, new_layer: NewLayer) -> Server<Stack<NewLayer, L>>
+    ```
+
+    Wraps all services in a Tower `Layer`. Use this to attach interceptors, timeout middleware, or any other Tower middleware.
+  </Accordion>
+</AccordionGroup>
+
+### Serving
+
+<ParamField path="serve" type="async fn(addr: SocketAddr) -> Result<(), Error>">
+  Binds to the given address and serves until the process exits. Drives all accepted connections on the Tokio runtime.
+</ParamField>
+
+<ParamField path="serve_with_shutdown" type="async fn(addr: SocketAddr, signal: F) -> Result<(), Error>">
+  Like `serve`, but accepts a future `signal: impl Future<Output = ()>`. When the future resolves the server performs a graceful shutdown, waiting for in-flight requests to complete.
+</ParamField>
+
+<Note>
+`add_service` takes a type that implements `NamedService + Clone + Send + Sync + 'static`. Generated stubs implement all of these automatically.
+</Note>
+
+---
+
+## Channel and Endpoint
+
+`Channel` is the client-side HTTP/2 connection pool. It is `Clone` and cheap to clone — all clones share the same underlying `tower::Buffer`. Use `Channel::from_static` or `Channel::from_shared` to get an `Endpoint` builder, then call `.connect().await` or `.connect_lazy()`.
+
+```rust client.rs
+use std::time::Duration;
+use tonic::transport::{Channel, Certificate, ClientTlsConfig};
+
+let cert = std::fs::read_to_string("ca.pem")?;
+
+let channel = Channel::from_static("https://example.com")
+    .tls_config(
+        ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(&cert))
+            .domain_name("example.com"),
+    )?
+    .timeout(Duration::from_secs(5))
+    .rate_limit(5, Duration::from_secs(1))
+    .concurrency_limit(256)
+    .connect()
+    .await?;
+```
+
+### `Channel` constructors
+
+<ParamField path="Channel::from_static" type="fn(s: &'static str) -> Endpoint">
+  Creates an `Endpoint` from a `'static` string URI. Panics if the URI is invalid.
+
+  ```rust
+  Channel::from_static("https://example.com");
+  ```
+</ParamField>
+
+<ParamField path="Channel::from_shared" type="fn(s: impl Into<Bytes>) -> Result<Endpoint, InvalidUri>">
+  Creates an `Endpoint` from owned bytes or a `String`. Returns an error instead of panicking on invalid URIs.
+
+  ```rust
+  Channel::from_shared("https://example.com".to_string())?;
+  ```
+</ParamField>
+
+<ParamField path="Channel::balance_list" type="fn(list: impl Iterator<Item = Endpoint>) -> Channel">
+  Constructs a `Channel` that load-balances across a static list of endpoints using `tower`'s power-of-two-choices algorithm.
+</ParamField>
+
+### `Endpoint` configuration
+
+`Endpoint` is returned by `Channel::from_static` / `Channel::from_shared`. All methods consume `self` and return a new `Endpoint` (builder pattern).
+
+<AccordionGroup>
+  <Accordion title="tls_config">
+    ```rust
+    #[cfg(feature = "_tls-any")]
+    pub fn tls_config(self, tls_config: ClientTlsConfig) -> Result<Self, Error>
+    ```
+
+    Configures TLS for the channel. When an `https://` URI is used without calling this method, a default `ClientTlsConfig` with enabled roots is applied automatically.
+  </Accordion>
+
+  <Accordion title="timeout">
+    ```rust
+    pub fn timeout(self, dur: Duration) -> Self
+    ```
+
+    Applies a per-request timeout on the client side. This does **not** set the `grpc-timeout` header; use `Request::set_timeout` to inform the server.
+  </Accordion>
+
+  <Accordion title="connect_timeout">
+    ```rust
+    pub fn connect_timeout(self, dur: Duration) -> Self
+    ```
+
+    Timeout for establishing the TCP/TLS connection. Defaults to no timeout.
+  </Accordion>
+
+  <Accordion title="rate_limit">
+    ```rust
+    pub fn rate_limit(self, limit: u64, duration: Duration) -> Self
+    ```
+
+    Limits the number of requests sent within a `duration` window to `limit`. Uses `tower`'s `RateLimit` middleware.
+  </Accordion>
+
+  <Accordion title="concurrency_limit">
+    ```rust
+    pub fn concurrency_limit(self, limit: usize) -> Self
+    ```
+
+    Caps the number of in-flight requests on this channel. Additional requests wait until a slot opens.
+  </Accordion>
+
+  <Accordion title="http2_keep_alive_interval">
+    ```rust
+    pub fn http2_keep_alive_interval(self, interval: Duration) -> Self
+    ```
+
+    Configures HTTP/2 PING keepalive frames sent from the client. Use alongside `keep_alive_timeout`.
+  </Accordion>
+
+  <Accordion title="connect / connect_lazy">
+    ```rust
+    pub async fn connect(&self) -> Result<Channel, Error>
+    pub fn connect_lazy(&self) -> Channel
+    ```
+
+    `connect` establishes the connection eagerly and returns an error if it cannot connect. `connect_lazy` defers the connection attempt until the first request is sent.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## TLS types
+
+### `Identity`
+
+Represents a private key and X.509 certificate pair used to authenticate a server (or a client in mutual TLS).
+
+```rust
+pub fn Identity::from_pem(cert: impl AsRef<[u8]>, key: impl AsRef<[u8]>) -> Self
+```
+
+Both `cert` and `key` must be PEM encoded. `cert` must contain at least one PEM certificate block.
+
+```rust
+let cert = std::fs::read_to_string("server.pem")?;
+let key  = std::fs::read_to_string("server.key")?;
+let identity = Identity::from_pem(&cert, &key);
+```
+
+### `Certificate`
+
+A PEM encoded X.509 certificate used as a CA certificate or client certificate.
+
+```rust
+pub fn Certificate::from_pem(pem: impl AsRef<[u8]>) -> Self
+```
+
+```rust
+let ca_cert = Certificate::from_pem(std::fs::read("ca.pem")?);
+```
+
+### `ServerTlsConfig`
+
+<ParamField path="ServerTlsConfig::new" type="fn() -> Self">
+  Creates a default `ServerTlsConfig`.
+</ParamField>
+
+<ParamField path="identity" type="fn(self, identity: Identity) -> Self">
+  Sets the server certificate and private key. Required.
+</ParamField>
+
+<ParamField path="client_ca_root" type="fn(self, cert: Certificate) -> Self">
+  Provides a CA certificate to validate incoming client certificates (mTLS).
+</ParamField>
+
+<ParamField path="client_auth_optional" type="fn(self, optional: bool) -> Self">
+  When `true`, client certificate verification is optional. Only meaningful when `client_ca_root` is set. Default is `false`.
+</ParamField>
+
+<ParamField path="timeout" type="fn(self, timeout: Duration) -> Self">
+  Sets the TLS handshake timeout.
+</ParamField>
+
+### `ClientTlsConfig`
+
+<ParamField path="ClientTlsConfig::new" type="fn() -> Self">
+  Creates a default `ClientTlsConfig` backed by Rustls.
+</ParamField>
+
+<ParamField path="domain_name" type="fn(self, domain_name: impl Into<String>) -> Self">
+  Sets the domain name used for SNI and certificate verification. Inferred from the URI if not set.
+</ParamField>
+
+<ParamField path="ca_certificate" type="fn(self, ca_certificate: Certificate) -> Self">
+  Adds a CA certificate to trust when verifying the server's certificate.
+</ParamField>
+
+<ParamField path="identity" type="fn(self, identity: Identity) -> Self">
+  Sets the client certificate and key for mutual TLS.
+</ParamField>
+
+<ParamField path="with_native_roots" type="fn(self) -> Self">
+  Enables the platform's native certificate roots. Requires the `tls-native-roots` feature.
+</ParamField>
+
+<ParamField path="with_webpki_roots" type="fn(self) -> Self">
+  Enables the Mozilla WebPKI root certificates. Requires the `tls-webpki-roots` feature.
+</ParamField>
+
+<Warning>
+`ServerTlsConfig::identity` is required when TLS is enabled on the server. Calling `tls_config` without setting an identity will panic at runtime inside `tls_acceptor`.
+</Warning>
+
+<Tip>
+For mutual TLS (mTLS), configure both `ServerTlsConfig::client_ca_root` on the server and `ClientTlsConfig::identity` on the client.
+</Tip>

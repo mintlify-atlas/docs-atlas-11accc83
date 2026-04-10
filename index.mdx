@@ -1,97 +1,81 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Tonic: Native gRPC for Rust"
+description: "Tonic is a high-performance gRPC client and server library for Rust with first-class async/await support, built on Tokio and Hyper."
 ---
 
-## Setting up
+Tonic is a native Rust implementation of [gRPC](https://grpc.io), a high-performance, open-source RPC framework. It provides everything you need to build production-grade gRPC services: async clients and servers, bi-directional streaming, TLS, interceptors, health checking, and more — all built on the Tokio async runtime.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Add Tonic to your Rust project and configure build dependencies
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build your first gRPC server and client in minutes
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Core Concepts" icon="book" href="/concepts/services-and-methods">
+    Understand services, streaming, metadata, and status codes
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/transport">
+    Explore the full public API for transport, client, and server
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Why Tonic?
 
-Everything you need to create world-class documentation.
+Tonic is built for Rust developers who need a reliable, ergonomic gRPC library that integrates naturally with the async Rust ecosystem.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={2}>
+  <Card title="Async-first design" icon="bolt">
+    Built on Tokio with native async/await — no blocking calls, no thread pools
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="Full streaming support" icon="arrows-left-right">
+    Unary, client-streaming, server-streaming, and bidirectional streaming
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="Production-ready TLS" icon="lock">
+    TLS via rustls with ring or aws-lc-rs backends, native root certificates
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
+  <Card title="Composable middleware" icon="layer-group">
+    Tower-compatible interceptors and middleware for auth, logging, and more
   </Card>
-</Columns>
+  <Card title="Code generation" icon="wand-magic-sparkles">
+    Generate type-safe clients and servers from `.proto` files with tonic-build
+  </Card>
+  <Card title="gRPC ecosystem" icon="puzzle-piece">
+    Health checking, server reflection, gRPC-Web, and Well-Known Types included
+  </Card>
+</CardGroup>
 
-## Need inspiration?
+## Get started
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Steps>
+  <Step title="Add Tonic to your project">
+    Add `tonic` and `prost` to your `Cargo.toml`, and `tonic-prost-build` to build dependencies.
+  </Step>
+  <Step title="Define your service in protobuf">
+    Write a `.proto` file defining your gRPC service, request, and response types.
+  </Step>
+  <Step title="Generate Rust code">
+    Use `tonic-prost-build` in your `build.rs` to generate type-safe Rust client and server stubs.
+  </Step>
+  <Step title="Implement and serve">
+    Implement the generated service trait, then start your server with `Server::builder()`.
+  </Step>
+</Steps>
+
+## Project layout
+
+Tonic is organized into focused crates, each independently usable:
+
+| Crate | Purpose |
+|---|---|
+| `tonic` | Core gRPC client and server implementation |
+| `tonic-build` | Code generation framework and traits |
+| `tonic-prost-build` | Prost-based `.proto` compilation |
+| `tonic-health` | Standard gRPC health checking service |
+| `tonic-reflection` | gRPC server reflection |
+| `tonic-types` | gRPC Well-Known Types |
+| `tonic-web` | gRPC-Web protocol support |
+
+<Note>
+  Tonic's minimum supported Rust version (MSRV) is **1.88**. Run `rustup update` to ensure you have a compatible toolchain.
+</Note>

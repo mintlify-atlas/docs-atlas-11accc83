@@ -1,0 +1,401 @@
+---
+title: 'tonic::Status and Code — gRPC Status and Error Handling'
+description: 'Complete reference for tonic::Status and Code: all 17 gRPC status codes, every constructor, field accessors, binary details, metadata, and into_http.'
+---
+
+`tonic::Status` represents the result of a gRPC RPC call. It carries a `Code`, a human-readable message, optional binary details, and optional trailing metadata. On the server side you return `Err(Status)` from a service handler; on the client side you receive a `Status` when the remote call fails. Every status code maps to a well-defined numeric value used in the `grpc-status` HTTP/2 trailer.
+
+## `Code` enum
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Code {
+    Ok = 0,
+    Cancelled = 1,
+    Unknown = 2,
+    InvalidArgument = 3,
+    DeadlineExceeded = 4,
+    NotFound = 5,
+    AlreadyExists = 6,
+    PermissionDenied = 7,
+    ResourceExhausted = 8,
+    FailedPrecondition = 9,
+    Aborted = 10,
+    OutOfRange = 11,
+    Unimplemented = 12,
+    Internal = 13,
+    Unavailable = 14,
+    DataLoss = 15,
+    Unauthenticated = 16,
+}
+```
+
+### All 17 status codes
+
+<AccordionGroup>
+  <Accordion title="Ok (0)">
+    The operation completed successfully. A `Status` with this code is informational — tonic does not return it as an `Err`.
+  </Accordion>
+
+  <Accordion title="Cancelled (1)">
+    The operation was cancelled, typically by the caller. Map from HTTP/2 `CANCEL` reset stream reason.
+  </Accordion>
+
+  <Accordion title="Unknown (2)">
+    Unknown error. Returned when a `Status` received from another address space belongs to an unknown error space, or when errors do not carry enough information to be mapped to a more specific code.
+  </Accordion>
+
+  <Accordion title="InvalidArgument (3)">
+    The client specified an invalid argument. Differs from `FailedPrecondition` in that the argument is problematic regardless of system state (e.g., a malformed filename).
+  </Accordion>
+
+  <Accordion title="DeadlineExceeded (4)">
+    The deadline expired before the operation could complete. May be returned even if the operation succeeded on the server side but the response was delayed past the deadline.
+  </Accordion>
+
+  <Accordion title="NotFound (5)">
+    A requested entity (file, user, record, etc.) was not found.
+  </Accordion>
+
+  <Accordion title="AlreadyExists (6)">
+    An entity that the client attempted to create already exists.
+  </Accordion>
+
+  <Accordion title="PermissionDenied (7)">
+    The caller does not have permission to execute the operation. Do not use for resource exhaustion (`ResourceExhausted`) or missing credentials (`Unauthenticated`).
+  </Accordion>
+
+  <Accordion title="ResourceExhausted (8)">
+    Some resource has been exhausted — a per-user quota, rate limit, or disk space. Also returned by the `load_shed` middleware when the service is overloaded.
+  </Accordion>
+
+  <Accordion title="FailedPrecondition (9)">
+    The operation was rejected because the system is not in the required state. Use when the client should not retry until the system state is explicitly fixed (e.g., trying to delete a non-empty directory).
+  </Accordion>
+
+  <Accordion title="Aborted (10)">
+    The operation was aborted, typically due to a concurrency issue such as a sequencer check failure or a transaction abort. The client should retry at a higher level.
+  </Accordion>
+
+  <Accordion title="OutOfRange (11)">
+    The operation was attempted past the valid range (e.g., reading past the end of a file). Unlike `InvalidArgument`, this may be fixed if the system state changes.
+  </Accordion>
+
+  <Accordion title="Unimplemented (12)">
+    The operation is not implemented or not supported in this service. Returned for unknown RPC methods.
+  </Accordion>
+
+  <Accordion title="Internal (13)">
+    An internal error. Some invariant expected by the underlying system has been broken. Seeing this code means something is seriously wrong.
+  </Accordion>
+
+  <Accordion title="Unavailable (14)">
+    The service is currently unavailable. This is a transient condition; the client should retry with exponential back-off. Maps from HTTP/2 `REFUSED_STREAM`.
+  </Accordion>
+
+  <Accordion title="DataLoss (15)">
+    Unrecoverable data loss or corruption.
+  </Accordion>
+
+  <Accordion title="Unauthenticated (16)">
+    The request does not have valid authentication credentials for the operation. Maps from HTTP `401 Unauthorized`.
+  </Accordion>
+</AccordionGroup>
+
+### `Code` utility methods
+
+```rust
+pub const fn Code::from_i32(i: i32) -> Code
+```
+Converts an integer to a `Code`. Unrecognized values map to `Code::Unknown`.
+
+```rust
+pub fn Code::description(&self) -> &'static str
+```
+Returns a human-readable description string. Also used by the `Display` implementation.
+
+---
+
+## `Status` struct
+
+```rust
+#[derive(Clone)]
+pub struct Status(Box<StatusInner>);
+```
+
+`Status` is `Clone` but not `Copy`. Its inner data is heap-allocated to keep the size of `Result<T, Status>` small on the stack.
+
+### Generic constructor
+
+```rust
+pub fn Status::new(code: Code, message: impl Into<String>) -> Status
+```
+
+Creates a `Status` with the given code and message. Details and metadata are empty.
+
+```rust
+let s = Status::new(Code::InvalidArgument, "name is invalid");
+assert_eq!(s.code(), Code::InvalidArgument);
+```
+
+### Constructors with details and metadata
+
+```rust
+pub fn Status::with_details(
+    code: Code,
+    message: impl Into<String>,
+    details: Bytes,
+) -> Status
+
+pub fn Status::with_metadata(
+    code: Code,
+    message: impl Into<String>,
+    metadata: MetadataMap,
+) -> Status
+
+pub fn Status::with_details_and_metadata(
+    code: Code,
+    message: impl Into<String>,
+    details: Bytes,
+    metadata: MetadataMap,
+) -> Status
+```
+
+Use `with_details` to attach a serialized protobuf `google.rpc.Status` payload in the `grpc-status-details-bin` trailer. Use `with_metadata` to attach additional trailing headers.
+
+### Per-code convenience constructors
+
+Each constructor accepts `message: impl Into<String>` and returns a `Status` with the corresponding `Code`.
+
+<AccordionGroup>
+  <Accordion title="Status::ok">
+    ```rust
+    pub fn ok(message: impl Into<String>) -> Status
+    ```
+    Code `0`. Informational; rarely used to construct an error.
+  </Accordion>
+
+  <Accordion title="Status::cancelled">
+    ```rust
+    pub fn cancelled(message: impl Into<String>) -> Status
+    ```
+    Code `1`. The operation was cancelled by the caller.
+  </Accordion>
+
+  <Accordion title="Status::unknown">
+    ```rust
+    pub fn unknown(message: impl Into<String>) -> Status
+    ```
+    Code `2`. Use when the error cannot be mapped to a more specific code.
+  </Accordion>
+
+  <Accordion title="Status::invalid_argument">
+    ```rust
+    pub fn invalid_argument(message: impl Into<String>) -> Status
+    ```
+    Code `3`. The client sent a bad argument.
+  </Accordion>
+
+  <Accordion title="Status::deadline_exceeded">
+    ```rust
+    pub fn deadline_exceeded(message: impl Into<String>) -> Status
+    ```
+    Code `4`. The request deadline expired.
+  </Accordion>
+
+  <Accordion title="Status::not_found">
+    ```rust
+    pub fn not_found(message: impl Into<String>) -> Status
+    ```
+    Code `5`. The requested entity does not exist.
+  </Accordion>
+
+  <Accordion title="Status::already_exists">
+    ```rust
+    pub fn already_exists(message: impl Into<String>) -> Status
+    ```
+    Code `6`. The entity already exists.
+  </Accordion>
+
+  <Accordion title="Status::permission_denied">
+    ```rust
+    pub fn permission_denied(message: impl Into<String>) -> Status
+    ```
+    Code `7`. The caller lacks permission.
+  </Accordion>
+
+  <Accordion title="Status::resource_exhausted">
+    ```rust
+    pub fn resource_exhausted(message: impl Into<String>) -> Status
+    ```
+    Code `8`. A quota or rate limit was exceeded.
+  </Accordion>
+
+  <Accordion title="Status::failed_precondition">
+    ```rust
+    pub fn failed_precondition(message: impl Into<String>) -> Status
+    ```
+    Code `9`. The system is not in the required state. Do not retry until the state is fixed.
+  </Accordion>
+
+  <Accordion title="Status::aborted">
+    ```rust
+    pub fn aborted(message: impl Into<String>) -> Status
+    ```
+    Code `10`. A concurrency conflict; retry at a higher level.
+  </Accordion>
+
+  <Accordion title="Status::out_of_range">
+    ```rust
+    pub fn out_of_range(message: impl Into<String>) -> Status
+    ```
+    Code `11`. The operation exceeded valid range boundaries.
+  </Accordion>
+
+  <Accordion title="Status::unimplemented">
+    ```rust
+    pub fn unimplemented(message: impl Into<String>) -> Status
+    ```
+    Code `12`. The method is not implemented or not enabled.
+  </Accordion>
+
+  <Accordion title="Status::internal">
+    ```rust
+    pub fn internal(message: impl Into<String>) -> Status
+    ```
+    Code `13`. An internal invariant was violated.
+  </Accordion>
+
+  <Accordion title="Status::unavailable">
+    ```rust
+    pub fn unavailable(message: impl Into<String>) -> Status
+    ```
+    Code `14`. The service is temporarily unavailable; retry with back-off.
+  </Accordion>
+
+  <Accordion title="Status::data_loss">
+    ```rust
+    pub fn data_loss(message: impl Into<String>) -> Status
+    ```
+    Code `15`. Data was lost or corrupted.
+  </Accordion>
+
+  <Accordion title="Status::unauthenticated">
+    ```rust
+    pub fn unauthenticated(message: impl Into<String>) -> Status
+    ```
+    Code `16`. The request is missing valid credentials.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Field accessors
+
+<ParamField path="code" type="fn(&self) -> Code">
+  Returns the `Code` of this status.
+
+  ```rust
+  if status.code() == Code::NotFound {
+      // handle missing resource
+  }
+  ```
+</ParamField>
+
+<ParamField path="message" type="fn(&self) -> &str">
+  Returns the human-readable error message. Transmitted in the `grpc-message` trailer, percent-encoded per the gRPC spec.
+</ParamField>
+
+<ParamField path="details" type="fn(&self) -> &[u8]">
+  Returns the opaque binary details field. This is the base64-decoded content of the `grpc-status-details-bin` trailer. Typically contains a serialized `google.rpc.Status` protobuf message.
+</ParamField>
+
+<ParamField path="metadata" type="fn(&self) -> &MetadataMap">
+  Returns custom metadata attached to the status. Headers reserved by the gRPC spec (`grpc-status`, `grpc-message`, `grpc-status-details-bin`) are excluded.
+</ParamField>
+
+<ParamField path="metadata_mut" type="fn(&mut self) -> &mut MetadataMap">
+  Mutable access to the status metadata. Use to attach custom trailer headers before returning the error.
+</ParamField>
+
+---
+
+## Error conversion
+
+### `Status::from_error`
+
+```rust
+pub fn from_error(err: Box<dyn Error + Send + Sync + 'static>) -> Status
+```
+
+Inspects the error source chain and attempts to map it to a `Status`. Recognizes `Status`, HTTP/2 errors, connection errors, and timeouts. Falls back to `Code::Unknown` if no specific mapping is found.
+
+### `Status::from_header_map`
+
+```rust
+pub fn from_header_map(header_map: &HeaderMap) -> Option<Status>
+```
+
+Parses `grpc-status`, `grpc-message`, and `grpc-status-details-bin` from an HTTP header map. Returns `None` if `grpc-status` is absent.
+
+### `impl From<std::io::Error> for Status`
+
+`std::io::Error` values are automatically converted to a `Status` with a code derived from the `ErrorKind`:
+
+| `ErrorKind` | `Code` |
+|---|---|
+| `NotFound` | `NotFound` |
+| `PermissionDenied` | `PermissionDenied` |
+| `ConnectionRefused`, `ConnectionReset`, `NotConnected` | `Unavailable` |
+| `AlreadyExists` | `AlreadyExists` |
+| `TimedOut` | `DeadlineExceeded` |
+| `InvalidInput` | `InvalidArgument` |
+| `InvalidData` | `DataLoss` |
+| `UnexpectedEof` | `OutOfRange` |
+| `BrokenPipe`, `WouldBlock`, `WriteZero`, `Interrupted` | `Internal` |
+| other | `Unknown` |
+
+---
+
+## `into_http`
+
+```rust
+pub fn into_http<B: Default>(self) -> http::Response<B>
+```
+
+Converts the `Status` into an HTTP response suitable for sending as a gRPC trailer-only response. The response body is `B::default()` (typically `hyper::Body::empty()`). The `grpc-status`, `grpc-message`, and `grpc-status-details-bin` headers are set in the response trailers, and `content-type: application/grpc` is set on the response.
+
+```rust
+let response: http::Response<hyper::Body> = Status::not_found("user not found").into_http();
+```
+
+<Note>
+`into_http` is primarily used internally by tonic's transport layer. In service implementations, return `Err(status)` directly rather than calling `into_http` yourself.
+</Note>
+
+---
+
+## `add_header`
+
+```rust
+pub fn add_header(&self, header_map: &mut HeaderMap) -> Result<(), Self>
+```
+
+Writes the status fields (`grpc-status`, `grpc-message`, `grpc-status-details-bin`) and any custom metadata into an existing `HeaderMap`. Returns `Err(Status::internal(...))` if any header value cannot be serialized.
+
+---
+
+## `set_source`
+
+```rust
+pub fn set_source(&mut self, source: Arc<dyn Error + Send + Sync + 'static>) -> &mut Status
+```
+
+Attaches an underlying error as the source of this status. The source is available via `std::error::Error::source` and is included in the `Debug` output, but is not transmitted to the client.
+
+<Warning>
+When choosing between `FailedPrecondition`, `Aborted`, and `Unavailable`, use the following guidance from the gRPC spec:
+- `Unavailable` — client can retry the failing call directly.
+- `Aborted` — client should retry at a higher level (restart a transaction).
+- `FailedPrecondition` — client should not retry until system state is explicitly corrected.
+</Warning>

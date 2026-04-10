@@ -1,0 +1,112 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "Tonic",
+  "projectDescription": "A native gRPC client and server library for Rust with async/await support, built on Tokio and Hyper.",
+  "theme": "luma",
+  "primaryColor": "#7c7c7c",
+  "lightColor": "#121212",
+  "darkColor": "#c9c9c9",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/services-and-methods",
+              "concepts/streaming",
+              "concepts/metadata",
+              "concepts/status-codes"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/tls",
+              "guides/authentication",
+              "guides/interceptors",
+              "guides/compression",
+              "guides/health-checking",
+              "guides/reflection",
+              "guides/grpc-web",
+              "guides/load-balancing"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core",
+            "pages": [
+              "api/transport",
+              "api/client",
+              "api/server",
+              "api/codec",
+              "api/status"
+            ]
+          },
+          {
+            "group": "Crates",
+            "pages": [
+              "api/tonic-build",
+              "api/tonic-health",
+              "api/tonic-reflection",
+              "api/tonic-types",
+              "api/tonic-web"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Async/await native gRPC client and server",
+    "Bi-directional streaming (unary, client-streaming, server-streaming, bidirectional)",
+    "TLS support via rustls (ring and aws-lc-rs backends)",
+    "Code generation from .proto files via tonic-build and prost",
+    "Load balancing with configurable strategies",
+    "Interceptors for middleware-style request/response processing",
+    "gRPC metadata (custom headers) support",
+    "gRPC-Web support via tonic-web",
+    "Standard gRPC health checking via tonic-health",
+    "gRPC server reflection via tonic-reflection",
+    "Message compression (gzip, deflate, zstd)",
+    "Built on Tokio, Hyper, and Tower ecosystem"
+  ],
+  "publicApiSurface": [
+    "tonic::transport::Server::builder()",
+    "tonic::transport::Channel::from_static()",
+    "tonic::transport::Endpoint",
+    "tonic::Request<T>",
+    "tonic::Response<T>",
+    "tonic::Status",
+    "tonic::Code",
+    "tonic::Streaming<T>",
+    "tonic::metadata::MetadataMap",
+    "tonic::codec::Codec",
+    "tonic::client::GrpcService",
+    "tonic::server::NamedService",
+    "tonic::transport::ClientTlsConfig",
+    "tonic::transport::ServerTlsConfig",
+    "tonic::transport::Identity",
+    "tonic::transport::Certificate",
+    "tonic_build::CodeGenBuilder",
+    "tonic_build::Service (trait)",
+    "tonic_build::Method (trait)",
+    "tonic_build::Attributes",
+    "tonic_health::server::HealthReporter",
+    "tonic_reflection::server::Builder",
+    "tonic_web::GrpcWebLayer"
+  ]
+}
